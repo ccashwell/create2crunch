@@ -30,6 +30,50 @@ const CONTROL_CHARACTER: u8 = 0xff;
 const MAX_INCREMENTER: u64 = 0xffffffffffff;
 
 static KERNEL_SRC: &str = include_str!("./kernels/keccak256.cl");
+static KERNEL_SRC_32: &str = include_str!("./kernels/keccak256_32.cl");
+
+/// Keccak-f[1600] round constants. Only the first 23 are used by the kernels;
+/// the final round is computed partially and skips iota.
+const KECCAK_RC: [u64; 24] = [
+    0x0000000000000001,
+    0x0000000000008082,
+    0x800000000000808a,
+    0x8000000080008000,
+    0x000000000000808b,
+    0x0000000080000001,
+    0x8000000080008081,
+    0x8000000000008009,
+    0x000000000000008a,
+    0x0000000000000088,
+    0x0000000080008009,
+    0x000000008000000a,
+    0x000000008000808b,
+    0x800000000000008b,
+    0x8000000000008089,
+    0x8000000000008003,
+    0x8000000000008002,
+    0x8000000000000080,
+    0x000000000000800a,
+    0x800000008000000a,
+    0x8000000080008081,
+    0x8000000000008080,
+    0x0000000080000001,
+    0x8000000080008008,
+];
+
+/// Split a 64-bit keccak lane into its even bits and odd bits, each packed
+/// into a 32-bit word. In this representation a 64-bit rotation costs only
+/// one or two native 32-bit rotations, which is what makes keccak fast on
+/// GPUs without 64-bit integer ALUs (e.g. Apple Silicon).
+fn bit_interleave(lane: u64) -> (u32, u32) {
+    let mut even = 0u32;
+    let mut odd = 0u32;
+    for i in 0..32 {
+        even |= (((lane >> (2 * i)) & 1) as u32) << i;
+        odd |= (((lane >> (2 * i + 1)) & 1) as u32) << i;
+    }
+    (even, odd)
+}
 
 /// Search for CREATE2 salts that produce gas-efficient or pattern-matching
 /// contract addresses.
@@ -86,6 +130,19 @@ pub struct Args {
     /// mode)
     #[arg(long)]
     pub cpu: bool,
+
+    /// GPU kernel word size: 32 uses a bit-interleaved keccak for GPUs
+    /// without native 64-bit integer ALUs (auto-selected on Apple)
+    #[arg(long, value_parser = parse_kernel_bits)]
+    pub kernel_bits: Option<u8>,
+}
+
+fn parse_kernel_bits(s: &str) -> Result<u8, String> {
+    match s {
+        "32" => Ok(32),
+        "64" => Ok(64),
+        _ => Err("kernel bits must be 32 or 64".into()),
+    }
 }
 
 fn parse_fixed_bytes<const N: usize>(s: &str) -> Result<[u8; N], String> {
@@ -250,6 +307,7 @@ pub struct Config {
     pub total_zeroes_threshold: u8,
     pub pattern: Option<Pattern>,
     pub cpu: bool,
+    pub kernel_bits: Option<u8>,
 }
 
 impl Config {
@@ -306,6 +364,7 @@ impl Config {
             total_zeroes_threshold,
             pattern,
             cpu: args.cpu,
+            kernel_bits: args.kernel_bits,
         })
     }
 }
@@ -509,6 +568,21 @@ pub fn gpu(config: Config, found_list: Option<FoundList>) -> ocl::Result<()> {
     // set up a platform to use
     let platform = Platform::new(ocl::core::default_platform()?);
 
+    // Apple GPUs have no native 64-bit integer ALUs, so the bit-interleaved
+    // 32-bit kernel is substantially faster there; allow manual override
+    let use_32bit = match config.kernel_bits {
+        Some(bits) => bits == 32,
+        None => platform.name()?.contains("Apple"),
+    };
+    println!(
+        "Using the {} keccak kernel...",
+        if use_32bit {
+            "bit-interleaved 32-bit"
+        } else {
+            "64-bit"
+        }
+    );
+
     // set up the device to use
     let device = Device::by_idx_wrap(platform, config.gpu_device as usize)?;
 
@@ -521,7 +595,7 @@ pub fn gpu(config: Config, found_list: Option<FoundList>) -> ocl::Result<()> {
     // set up the program to use
     let program = Program::builder()
         .devices(device)
-        .src(mk_kernel_src(&config))
+        .src(mk_kernel_src(&config, use_32bit))
         .build(&context)?;
 
     // set up the queue to use
@@ -798,9 +872,10 @@ fn output_file() -> File {
 }
 
 /// Creates the OpenCL kernel source code by populating the template with the
-/// values from the Config object.
-fn mk_kernel_src(config: &Config) -> String {
-    let mut src = String::with_capacity(2048 + KERNEL_SRC.len());
+/// values from the Config object. `use_32bit` selects the bit-interleaved
+/// keccak kernel for GPUs without native 64-bit integer ALUs.
+fn mk_kernel_src(config: &Config, use_32bit: bool) -> String {
+    let mut src = String::with_capacity(4096 + KERNEL_SRC.len().max(KERNEL_SRC_32.len()));
 
     let factory = config.factory_address.iter();
     let caller = config.calling_address.iter();
@@ -836,7 +911,38 @@ fn mk_kernel_src(config: &Config) -> String {
         writeln!(src, "#define hasPattern(d) ({conditions})").unwrap();
     }
 
-    src.push_str(KERNEL_SRC);
+    if use_32bit {
+        // the sponge template with all compile-time-constant bytes in place;
+        // bytes 41..53 (salt_random_segment and nonce) are set per work item
+        let mut template = [0u8; 136];
+        template[0] = CONTROL_CHARACTER;
+        template[1..21].copy_from_slice(&config.factory_address);
+        template[21..41].copy_from_slice(&config.calling_address);
+        template[53..85].copy_from_slice(&config.init_code_hash);
+        template[85] = 0x01; // keccak-256 padding start
+        template[135] = 0x80; // keccak-256 padding end
+
+        // lanes 5 and 6 hold the per-work-item bytes and are assembled in the
+        // kernel; lanes 11..=15 and 17..=24 are zero
+        for i in [0usize, 1, 2, 3, 4, 7, 8, 9, 10, 16] {
+            let lane = u64::from_le_bytes(template[8 * i..8 * i + 8].try_into().unwrap());
+            let (even, odd) = bit_interleave(lane);
+            writeln!(src, "#define A{i}_E {even}u").unwrap();
+            writeln!(src, "#define A{i}_O {odd}u").unwrap();
+        }
+
+        // pre-interleaved iota round constants (the partial 24th round needs
+        // no iota, so only 23 are emitted)
+        for (i, rc) in KECCAK_RC.iter().enumerate().take(23) {
+            let (even, odd) = bit_interleave(*rc);
+            writeln!(src, "#define RC{i}_E {even}u").unwrap();
+            writeln!(src, "#define RC{i}_O {odd}u").unwrap();
+        }
+
+        src.push_str(KERNEL_SRC_32);
+    } else {
+        src.push_str(KERNEL_SRC);
+    }
 
     src
 }
@@ -857,6 +963,62 @@ mod tests {
             suffix: None,
             hook_flags: None,
             cpu: false,
+            kernel_bits: None,
+        }
+    }
+
+    /// Mirrors the delta-swap networks in keccak256_32.cl so the kernel's
+    /// interleaving is pinned against the reference implementation.
+    fn delta_swap(x: u32, shift: u32, mask: u32) -> u32 {
+        let t = (x ^ (x >> shift)) & mask;
+        x ^ t ^ (t << shift)
+    }
+
+    fn kernel_unshuffle(mut x: u32) -> u32 {
+        x = delta_swap(x, 1, 0x22222222);
+        x = delta_swap(x, 2, 0x0c0c0c0c);
+        x = delta_swap(x, 4, 0x00f000f0);
+        x = delta_swap(x, 8, 0x0000ff00);
+        x
+    }
+
+    fn kernel_shuffle(mut x: u32) -> u32 {
+        x = delta_swap(x, 8, 0x0000ff00);
+        x = delta_swap(x, 4, 0x00f000f0);
+        x = delta_swap(x, 2, 0x0c0c0c0c);
+        x = delta_swap(x, 1, 0x22222222);
+        x
+    }
+
+    fn kernel_interleave(lane: u64) -> (u32, u32) {
+        let lo = kernel_unshuffle(lane as u32);
+        let hi = kernel_unshuffle((lane >> 32) as u32);
+        ((lo & 0xffff) | (hi << 16), (lo >> 16) | (hi & 0xffff0000))
+    }
+
+    #[test]
+    fn kernel_bit_interleaving_matches_reference() {
+        // deterministic pseudorandom coverage (splitmix64)
+        let mut x = 0x9e3779b97f4a7c15u64;
+        let mut lanes = vec![0, 1, u64::MAX, 0x8000000080008008];
+        for _ in 0..1000 {
+            x = x.wrapping_add(0x9e3779b97f4a7c15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+            lanes.push(z ^ (z >> 31));
+        }
+        for lane in lanes {
+            assert_eq!(
+                kernel_interleave(lane),
+                bit_interleave(lane),
+                "lane {lane:#x}"
+            );
+            let (e, o) = bit_interleave(lane);
+            // the kernel's digest de-interleaving must invert the interleave
+            let lo = kernel_shuffle((e & 0xffff) | ((o & 0xffff) << 16));
+            let hi = kernel_shuffle((e >> 16) | (o & 0xffff0000));
+            assert_eq!(((hi as u64) << 32) | lo as u64, lane, "lane {lane:#x}");
         }
     }
 
@@ -954,14 +1116,40 @@ mod tests {
         let mut args = test_args();
         args.hook_flags = Some(0x2400);
         let config = Config::new(args).unwrap();
-        let src = mk_kernel_src(&config);
+        let src = mk_kernel_src(&config, false);
         assert!(src.contains("#define PATTERN 1"));
         assert!(src.contains("#define hasPattern(d) ((((d)[18] & 63u) == 36u) && ((d)[19] == 0u))"));
         assert!(src.contains("#define LEADING_ZEROES 0"));
         assert!(src.contains("#define TOTAL_ZEROES 255"));
 
         let classic = Config::new(test_args()).unwrap();
-        assert!(!mk_kernel_src(&classic).contains("#define PATTERN 1"));
+        assert!(!mk_kernel_src(&classic, false).contains("#define PATTERN 1"));
+    }
+
+    #[test]
+    fn kernel_src_32bit_embeds_interleaved_constants() {
+        let mut args = test_args();
+        args.hook_flags = Some(0x2400);
+        let config = Config::new(args).unwrap();
+        let src = mk_kernel_src(&config, true);
+
+        // lane 0 = 0xff ++ factory[0..7]; the test factory is all 0x11
+        let lane0 = u64::from_le_bytes([0xff, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11]);
+        let (e, o) = bit_interleave(lane0);
+        assert!(src.contains(&format!("#define A0_E {e}u")));
+        assert!(src.contains(&format!("#define A0_O {o}u")));
+
+        // padding lane 16 = 0x80 in its top byte
+        let (e, o) = bit_interleave(0x8000000000000000);
+        assert!(src.contains(&format!("#define A16_E {e}u")));
+        assert!(src.contains(&format!("#define A16_O {o}u")));
+
+        // all 23 iota constants, and the pattern check, are present
+        let (e, o) = bit_interleave(KECCAK_RC[22]);
+        assert!(src.contains(&format!("#define RC22_E {e}u")));
+        assert!(src.contains(&format!("#define RC22_O {o}u")));
+        assert!(src.contains("#define hasPattern"));
+        assert!(src.contains("bit-interleaved"));
     }
 
     #[test]
