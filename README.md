@@ -20,7 +20,28 @@ For each efficient address found, the salt, resultant addresses, and value *(i.e
 
 This tool was originally built for use with [`Pr000xy`](https://github.com/0age/Pr000xy), including with [`Create2Factory`](https://github.com/0age/Pr000xy/blob/master/contracts/Create2Factory.sol) directly.
 
-There is also an experimental OpenCL feature that can be used to search for addresses using a GPU. To give it a try, include a fourth parameter specifying the device ID to use, and optionally a fifth and sixth parameter to filter returned results by a threshold based on leading zero bytes and total zero bytes, respectively. By way of example, to perform the same search as above, but using OpenCL device 2 and only returning results that create addresses with at least four leading zeroes or six total zeroes, use `$ cargo run --release $FACTORY $CALLER $INIT_CODE_HASH 2 4 6` (you'll also probably want to try tweaking the `WORK_SIZE` parameter in `src/lib.rs`).
+There is also a GPU search mode. To give it a try, include a fourth parameter specifying the device ID to use, and optionally a fifth and sixth parameter to filter returned results by a threshold based on leading zero bytes and total zero bytes, respectively. By way of example, to perform the same search as above, but using GPU device 2 and only returning results that create addresses with at least four leading zeroes or six total zeroes, use `$ cargo run --release $FACTORY $CALLER $INIT_CODE_HASH 2 4 6` (you'll also probably want to try tweaking the `WORK_SIZE` parameter in `src/lib.rs`).
+
+## GPU backends and Apple Silicon
+
+Two GPU backends are available, selected with `--backend <auto|opencl|metal>`:
+
+- **Metal** (default on macOS): drives the kernel through Metal directly. On Apple Silicon this is roughly **10x faster** than going through Apple's deprecated OpenCL-over-Metal shim - same kernel, modern compiler and runtime.
+- **OpenCL** (default elsewhere): the original backend. On Apple platforms it automatically uses a bit-interleaved 32-bit keccak kernel (Apple GPUs have no native 64-bit integer ALUs); override with `--kernel-bits 32|64`.
+
+Add `--cpu` to any GPU run to also mine on all CPU cores simultaneously - the CPU path uses hand-written CRYPTOGAMS assembly (via `keccak-asm`) and is worth another ~40 Mh/s on an M4 Max. Both miners share the display and the output file.
+
+Measured on an Apple M4 Max (14-core CPU, 40-core GPU):
+
+| Configuration | Rate |
+|---|---|
+| CPU only (all cores) | ~42 Mh/s |
+| GPU, OpenCL backend, 64-bit kernel | ~63 Mh/s |
+| GPU, OpenCL backend, bit-interleaved kernel | ~71 Mh/s |
+| GPU, Metal backend (macOS default) | ~740 Mh/s |
+| GPU Metal + `--cpu` | ~780 Mh/s |
+
+At ~750 Mh/s, v4 hook flags alone (2^14) are instant, flags + a 4-character vanity prefix (2^30) averages under two seconds, flags + 6 characters (2^38) about six minutes, and flags + 8 characters (2^46) about a day.
 
 ## Pattern mining (prefixes, suffixes, and Uniswap v4 hooks)
 
@@ -66,7 +87,7 @@ $ export INIT_CODE_HASH="<keccak256 of your hook creation code ++ abi-encoded co
 $ cargo run --release -- $FACTORY $CALLER $INIT_CODE_HASH --hook-flags 0x00C0 --prefix c0ffee
 ```
 
-The 14 flag bits alone cost ~2^14 attempts (instant); each additional vanity prefix character multiplies difficulty by 16. The init code hash covers the constructor arguments too: `keccak256(abi.encodePacked(type(MyHook).creationCode, abi.encode(...)))`. Verify a mined salt before use:
+The 14 flag bits alone cost ~2^14 attempts (instant); each additional vanity prefix character multiplies difficulty by 16. For long prefixes, add a GPU device and `--cpu` (see the backends section below). The init code hash covers the constructor arguments too: `keccak256(abi.encodePacked(type(MyHook).creationCode, abi.encode(...)))`. Verify a mined salt before use:
 
 ```sh
 $ cast create2 --deployer $FACTORY --salt <salt> --init-code-hash $INIT_CODE_HASH
