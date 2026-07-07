@@ -140,10 +140,12 @@ pub struct Args {
     #[arg(long, value_name = "FLAGS", value_parser = parse_hook_flags)]
     pub hook_flags: Option<u16>,
 
-    /// Also mine on all CPU cores while the GPU mines (no effect in CPU-only
-    /// mode)
+    /// Do not also mine on the CPU while the GPU mines. By default a GPU run
+    /// additionally hashes on all CPU cores (~15-20% more throughput); pass
+    /// this to keep the machine responsive or to benchmark the GPU alone. No
+    /// effect in CPU-only mode.
     #[arg(long)]
-    pub cpu: bool,
+    pub no_cpu: bool,
 
     /// GPU kernel word size: 32 uses a bit-interleaved keccak for GPUs
     /// without native 64-bit integer ALUs (auto-selected on Apple; OpenCL
@@ -394,7 +396,7 @@ impl Config {
             leading_zeroes_threshold,
             total_zeroes_threshold,
             pattern,
-            cpu: args.cpu,
+            cpu: !args.no_cpu,
             kernel_bits: args.kernel_bits,
             backend: args.backend,
         })
@@ -486,7 +488,9 @@ impl Progress {
                 format!("0x{}", hex::encode(config.init_code_hash)),
             ),
         ];
-        if config.cpu {
+        // the extra "+ cpu" row is only meaningful when the CPU assists a
+        // separate GPU; in CPU-only mode the backend row already says "CPU"
+        if config.cpu && config.gpu_device != 255 {
             config_rows.push(("+ cpu", cpu_kernel_label().to_string()));
         }
 
@@ -1330,7 +1334,7 @@ mod tests {
             prefix: None,
             suffix: None,
             hook_flags: None,
-            cpu: false,
+            no_cpu: false,
             kernel_bits: None,
             backend: Backend::Auto,
         }

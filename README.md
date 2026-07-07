@@ -29,7 +29,9 @@ Two GPU backends are available, selected with `--backend <auto|opencl|metal>`:
 - **Metal** (default on macOS): drives the kernel through Metal directly. On Apple Silicon this is roughly **10x faster** than going through Apple's deprecated OpenCL-over-Metal shim - same kernel, modern compiler and runtime.
 - **OpenCL** (default elsewhere): the original backend. On Apple platforms it automatically uses a bit-interleaved 32-bit keccak kernel (Apple GPUs have no native 64-bit integer ALUs); override with `--kernel-bits 32|64`.
 
-Add `--cpu` to any GPU run to also mine on all CPU cores simultaneously. On aarch64 CPUs with the ARMv8.4 SHA3 extension (all Apple M-series), the CPU path hashes two candidates at once in the 128-bit NEON registers via the `EOR3`/`RAX1`/`XAR`/`BCAX` instructions - about 2x the throughput of the scalar CRYPTOGAMS assembly path (which is used as the fallback and elsewhere). Both miners share the display and the output file.
+A GPU run also mines on all CPU cores by default; pass `--no-cpu` to keep the machine responsive (or to benchmark the GPU alone). On aarch64 CPUs with the ARMv8.4 SHA3 extension (all Apple M-series), the CPU path hashes two candidates at once in the 128-bit NEON registers via the `EOR3`/`RAX1`/`XAR`/`BCAX` instructions - about 2x the throughput of the scalar CRYPTOGAMS assembly path (which is used as the fallback and elsewhere). Both miners share the display and the output file.
+
+Co-mining is not purely additive: the CPU competes with the GPU for memory bandwidth and thermal headroom, so the net gain on an M4 Max is about 15-20% over the GPU alone (the CPU's full standalone rate minus what the GPU gives up), in exchange for pinning every core.
 
 Measured on an Apple M4 Max (14-core CPU, 40-core GPU); GPU figures are cool-state and vary with thermals:
 
@@ -39,10 +41,10 @@ Measured on an Apple M4 Max (14-core CPU, 40-core GPU); GPU figures are cool-sta
 | CPU only, 2-way SHA3 NEON | ~151 Mh/s |
 | GPU, OpenCL backend, 64-bit kernel | ~63 Mh/s |
 | GPU, OpenCL backend, bit-interleaved kernel | ~71 Mh/s |
-| GPU, Metal backend (macOS default) | ~740 Mh/s |
-| GPU Metal + `--cpu` (2-way) | ~770 Mh/s |
+| GPU, Metal backend, `--no-cpu` | ~740 Mh/s |
+| GPU Metal + CPU (default) | ~800 Mh/s |
 
-The CPU adds its full throughput on top of the GPU; running both, the GPU retains ~85% of its solo rate (shared memory bandwidth), so `--cpu` is close to purely additive.
+Running both, the GPU retains ~85% of its solo rate (shared memory bandwidth) while the CPU adds its own, for a ~15-20% net gain over the GPU alone.
 
 At ~750 Mh/s, v4 hook flags alone (2^14) are instant, flags + a 4-character vanity prefix (2^30) averages under two seconds, flags + 6 characters (2^38) about six minutes, and flags + 8 characters (2^46) about a day.
 
@@ -90,7 +92,7 @@ $ export INIT_CODE_HASH="<keccak256 of your hook creation code ++ abi-encoded co
 $ cargo run --release -- $FACTORY $CALLER $INIT_CODE_HASH --hook-flags 0x00C0 --prefix c0ffee
 ```
 
-The 14 flag bits alone cost ~2^14 attempts (instant); each additional vanity prefix character multiplies difficulty by 16. For long prefixes, add a GPU device and `--cpu` (see the backends section below). The init code hash covers the constructor arguments too: `keccak256(abi.encodePacked(type(MyHook).creationCode, abi.encode(...)))`. Verify a mined salt before use:
+The 14 flag bits alone cost ~2^14 attempts (instant); each additional vanity prefix character multiplies difficulty by 16. For long prefixes, add a GPU device (see the backends section below). The init code hash covers the constructor arguments too: `keccak256(abi.encodePacked(type(MyHook).creationCode, abi.encode(...)))`. Verify a mined salt before use:
 
 ```sh
 $ cast create2 --deployer $FACTORY --salt <salt> --init-code-hash $INIT_CODE_HASH
