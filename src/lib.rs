@@ -6,6 +6,7 @@ use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use clap::Parser;
 use console::Term;
 use fs4::FileExt;
+use keccak_asm::{Digest, Keccak256};
 use ocl::{Buffer, Context, Device, MemFlags, Platform, ProQue, Program, Queue};
 use rand::{thread_rng, Rng};
 use rayon::prelude::*;
@@ -16,7 +17,6 @@ use std::fs::{File, OpenOptions};
 use std::io::prelude::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 use terminal_size::{terminal_size, Height};
-use tiny_keccak::{Hasher, Keccak};
 
 mod reward;
 pub use reward::Reward;
@@ -324,18 +324,14 @@ pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
 
     // begin searching for addresses
     loop {
-        // header: 0xff ++ factory ++ caller ++ salt_random_segment (47 bytes)
-        let mut header = [0; 47];
-        header[0] = CONTROL_CHARACTER;
-        header[1..21].copy_from_slice(&config.factory_address);
-        header[21..41].copy_from_slice(&config.calling_address);
-        header[41..].copy_from_slice(&FixedBytes::<6>::random()[..]);
-
-        // create new hash object
-        let mut hash_header = Keccak::v256();
-
-        // update hash with header
-        hash_header.update(&header);
+        // message: 0xff ++ factory ++ caller ++ salt_random_segment (47 bytes)
+        // ++ 6-byte nonce ++ init code hash (85 bytes total)
+        let mut template = [0u8; 85];
+        template[0] = CONTROL_CHARACTER;
+        template[1..21].copy_from_slice(&config.factory_address);
+        template[21..41].copy_from_slice(&config.calling_address);
+        template[41..47].copy_from_slice(&FixedBytes::<6>::random()[..]);
+        template[53..].copy_from_slice(&config.init_code_hash);
 
         // iterate over a 6-byte nonce and compute each address
         (0..MAX_INCREMENTER)
@@ -344,16 +340,10 @@ pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
                 let salt = salt.to_le_bytes();
                 let salt_incremented_segment = &salt[..6];
 
-                // clone the partially-hashed object
-                let mut hash = hash_header.clone();
-
-                // update with body and footer (total: 38 bytes)
-                hash.update(salt_incremented_segment);
-                hash.update(&config.init_code_hash);
-
-                // hash the payload and get the result
-                let mut res: [u8; 32] = [0; 32];
-                hash.finalize(&mut res);
+                // splice the nonce into the message and hash it
+                let mut message = template;
+                message[47..53].copy_from_slice(salt_incremented_segment);
+                let res = Keccak256::digest(message);
 
                 // get the address that results from the hash
                 let address = <&Address>::try_from(&res[12..]).unwrap();
@@ -404,9 +394,11 @@ pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
                 };
 
                 // get the full salt used to create the address
-                let header_hex_string = hex::encode(header);
-                let body_hex_string = hex::encode(salt_incremented_segment);
-                let full_salt = format!("0x{}{}", &header_hex_string[42..], &body_hex_string);
+                let full_salt = format!(
+                    "0x{}{}",
+                    hex::encode(&template[21..47]),
+                    hex::encode(salt_incremented_segment)
+                );
 
                 // display the salt and the address.
                 let output = format!(
@@ -697,15 +689,8 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
             solution_message[45..53].copy_from_slice(&solution);
             solution_message[53..].copy_from_slice(&config.init_code_hash);
 
-            // create new hash object
-            let mut hash = Keccak::v256();
-
-            // update with header
-            hash.update(&solution_message);
-
             // hash the payload and get the result
-            let mut res: [u8; 32] = [0; 32];
-            hash.finalize(&mut res);
+            let res = Keccak256::digest(solution_message);
 
             // get the address that results from the hash
             let address = <&Address>::try_from(&res[12..]).unwrap();

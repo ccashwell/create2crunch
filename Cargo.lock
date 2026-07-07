@@ -418,13 +418,13 @@ dependencies = [
  "clap",
  "console",
  "fs4",
+ "keccak-asm",
  "ocl",
  "rand",
  "rayon",
  "rustc-hash",
  "separator",
  "terminal_size",
- "tiny-keccak",
 ]
 
 [[package]]
