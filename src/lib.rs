@@ -101,28 +101,30 @@ fn bit_interleave(lane: u64) -> (u32, u32) {
 #[command(name = "create2crunch", version)]
 pub struct Args {
     /// Address of the contract that will call CREATE2 (the factory)
-    #[arg(value_parser = parse_fixed_bytes::<20>)]
+    #[arg(short = 'f', long, value_parser = parse_fixed_bytes::<20>)]
     pub factory: [u8; 20],
 
     /// Address of the caller of the factory, for factories with frontrunning
     /// protection (use the zero address if not applicable)
-    #[arg(value_parser = parse_fixed_bytes::<20>)]
+    #[arg(short = 'c', long, value_parser = parse_fixed_bytes::<20>)]
     pub caller: [u8; 20],
 
     /// Keccak-256 hash of the initialization code of the contract to deploy
-    #[arg(value_parser = parse_fixed_bytes::<32>)]
+    #[arg(short = 'i', long, value_parser = parse_fixed_bytes::<32>)]
     pub init_code_hash: [u8; 32],
 
-    /// OpenCL GPU device to use (255 = CPU)
-    #[arg(default_value_t = 255)]
+    /// GPU device to use (255 = CPU-only)
+    #[arg(short = 'g', long, default_value_t = 255)]
     pub gpu_device: u8,
 
     /// Leading zero-bytes threshold (defaults to 3, or 0 when a pattern is
     /// given; in pattern mode a non-zero value is ANDed with the pattern)
+    #[arg(long)]
     pub leading_zeroes: Option<u8>,
 
     /// Total zero-bytes threshold (defaults to 5, or disabled when a pattern
     /// is given; in pattern mode a value of 0..=20 is ANDed with the pattern)
+    #[arg(long)]
     pub total_zeroes: Option<u8>,
 
     /// Require the address to start with this hex string (up to 40 hex
@@ -1530,8 +1532,11 @@ mod tests {
         use clap::Parser as _;
         let args = Args::try_parse_from([
             "create2crunch",
+            "--factory",
             "0x0000000000ffe8b47b3e2130213b802212439497",
+            "--caller",
             "0x0000000000000000000000000000000000000000",
+            "--init-code-hash",
             "0x2222222222222222222222222222222222222222222222222222222222222222",
             "--hook-flags",
             "0x3fff",
@@ -1541,13 +1546,41 @@ mod tests {
         .unwrap();
         assert_eq!(args.hook_flags, Some(0x3fff));
         assert_eq!(args.gpu_device, 255);
+
+        // short flags resolve to the same fields
+        let short = Args::try_parse_from([
+            "create2crunch",
+            "-f",
+            "0x0000000000ffe8b47b3e2130213b802212439497",
+            "-c",
+            "0x0000000000000000000000000000000000000000",
+            "-i",
+            "0x2222222222222222222222222222222222222222222222222222222222222222",
+            "-g",
+            "2",
+        ])
+        .unwrap();
+        assert_eq!(short.factory, args.factory);
+        assert_eq!(short.gpu_device, 2);
+
+        // out-of-range hook flags are rejected
         assert!(Args::try_parse_from([
             "create2crunch",
+            "--factory",
             "0x0000000000ffe8b47b3e2130213b802212439497",
+            "--caller",
             "0x0000000000000000000000000000000000000000",
+            "--init-code-hash",
             "0x2222222222222222222222222222222222222222222222222222222222222222",
             "--hook-flags",
             "0x4000",
+        ])
+        .is_err());
+
+        // the CREATE2 inputs are now required named flags, not positionals
+        assert!(Args::try_parse_from([
+            "create2crunch",
+            "0x0000000000ffe8b47b3e2130213b802212439497",
         ])
         .is_err());
     }

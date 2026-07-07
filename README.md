@@ -13,14 +13,16 @@ $ cd create2crunch
 $ export FACTORY="0x0000000000ffe8b47b3e2130213b802212439497"
 $ export CALLER="<YOUR_DEPLOYER_ADDRESS_OF_CHOICE_GOES_HERE>"
 $ export INIT_CODE_HASH="<HASH_OF_YOUR_CONTRACT_INIT_CODE_GOES_HERE>"
-$ cargo run --release $FACTORY $CALLER $INIT_CODE_HASH
+$ cargo run --release -- --factory $FACTORY --caller $CALLER --init-code-hash $INIT_CODE_HASH
 ```
+
+All inputs are named flags (short forms `-f`, `-c`, `-i`), so order doesn't matter and each value is unambiguous. Run `create2crunch --help` for the full list.
 
 For each efficient address found, the salt, resultant addresses, and value *(i.e. approximate rarity)* will be written to `efficient_addresses.txt`. Verify that one of the salts actually results in the intended address before getting in too deep - ideally, the CREATE2 factory will have a view method for checking what address you'll get for submitting a particular salt. Be sure not to change the factory address or the init code without first removing any existing data to prevent the two salt types from becoming commingled. There's also a *very* simple monitoring tool available if you run `$python3 analysis.py` in another tab.
 
 This tool was originally built for use with [`Pr000xy`](https://github.com/0age/Pr000xy), including with [`Create2Factory`](https://github.com/0age/Pr000xy/blob/master/contracts/Create2Factory.sol) directly.
 
-There is also a GPU search mode. To give it a try, include a fourth parameter specifying the device ID to use, and optionally a fifth and sixth parameter to filter returned results by a threshold based on leading zero bytes and total zero bytes, respectively. By way of example, to perform the same search as above, but using GPU device 2 and only returning results that create addresses with at least four leading zeroes or six total zeroes, use `$ cargo run --release $FACTORY $CALLER $INIT_CODE_HASH 2 4 6` (you'll also probably want to try tweaking the `WORK_SIZE` parameter in `src/lib.rs`).
+There is also a GPU search mode. To give it a try, add `--gpu-device <ID>` to select a device, and optionally `--leading-zeroes <N>` and `--total-zeroes <N>` to filter returned results by leading and total zero bytes. By way of example, to perform the same search as above, but using GPU device 2 and only returning results that create addresses with at least four leading zeroes or six total zeroes, use `$ cargo run --release -- -f $FACTORY -c $CALLER -i $INIT_CODE_HASH --gpu-device 2 --leading-zeroes 4 --total-zeroes 6` (you'll also probably want to try tweaking the `WORK_SIZE` parameter in `src/lib.rs`).
 
 ## GPU backends and Apple Silicon
 
@@ -89,7 +91,7 @@ When deploying via `forge script` with `new MyHook{salt: salt}(...)`, contracts 
 $ export FACTORY="0x4e59b44847b379578588920cA78FbF26c0B4956C"
 $ export CALLER="0x0000000000000000000000000000000000000000"
 $ export INIT_CODE_HASH="<keccak256 of your hook creation code ++ abi-encoded constructor args>"
-$ cargo run --release -- $FACTORY $CALLER $INIT_CODE_HASH --hook-flags 0x00C0 --prefix c0ffee
+$ cargo run --release -- --factory $FACTORY --caller $CALLER --init-code-hash $INIT_CODE_HASH --hook-flags 0x00C0 --prefix c0ffee
 ```
 
 The 14 flag bits alone cost ~2^14 attempts (instant); each additional vanity prefix character multiplies difficulty by 16. For long prefixes, add a GPU device (see the backends section below). The init code hash covers the constructor arguments too: `keccak256(abi.encodePacked(type(MyHook).creationCode, abi.encode(...)))`. Verify a mined salt before use:
