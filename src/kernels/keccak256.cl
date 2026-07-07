@@ -352,16 +352,31 @@ __kernel void hashMessage(
   keccakf(spongeBuffer);
 
   // determine if the address meets the constraints
+#ifdef PATTERN
+  // pattern search: all provided constraints must hold simultaneously
   if (
-    hasLeading(digest) 
+    hasPattern(digest)
+#if LEADING_ZEROES > 0
+    && hasLeading(digest)
+#endif
+#if TOTAL_ZEROES <= 20
+    && hasTotal(digest)
+#endif
+  ) {
+    solutions[0] = nonce.uint64_t;
+  }
+#else
+  if (
+    hasLeading(digest)
 #if TOTAL_ZEROES <= 20
     || hasTotal(digest)
 #endif
   ) {
-    // To be honest, if we are using OpenCL, 
+    // To be honest, if we are using OpenCL,
     // we just need to write one solution for all practical purposes,
     // since the chance of multiple solutions appearing
     // in a single workset is extremely low.
     solutions[0] = nonce.uint64_t;
   }
+#endif
 }

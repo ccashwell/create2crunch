@@ -22,4 +22,54 @@ This tool was originally built for use with [`Pr000xy`](https://github.com/0age/
 
 There is also an experimental OpenCL feature that can be used to search for addresses using a GPU. To give it a try, include a fourth parameter specifying the device ID to use, and optionally a fifth and sixth parameter to filter returned results by a threshold based on leading zero bytes and total zero bytes, respectively. By way of example, to perform the same search as above, but using OpenCL device 2 and only returning results that create addresses with at least four leading zeroes or six total zeroes, use `$ cargo run --release $FACTORY $CALLER $INIT_CODE_HASH 2 4 6` (you'll also probably want to try tweaking the `WORK_SIZE` parameter in `src/lib.rs`).
 
+## Pattern mining (prefixes, suffixes, and Uniswap v4 hooks)
+
+Instead of scoring addresses by zero bytes, you can search for addresses matching an exact bit pattern. Three options may be combined (their fixed bits must agree), and each works on both the CPU and GPU paths:
+
+- `--prefix <HEX>` — address must start with these hex characters (odd lengths allowed)
+- `--suffix <HEX>` — address must end with these hex characters (odd lengths allowed)
+- `--hook-flags <FLAGS>` — Uniswap v4 hook mining: requires `address & 0x3fff == FLAGS`, an exact match on all 14 permission bits (the same check as v4-periphery's `HookMiner`)
+
+When any pattern option is given, the zero-byte thresholds default to disabled; passing them explicitly ANDs them with the pattern (e.g. `--hook-flags 0xC0` plus a leading-zeroes threshold of 4).
+
+### Uniswap v4 hook flags
+
+Hook addresses encode their permissions in the lowest 14 bits of the address (`Hooks.ALL_HOOK_MASK`), and `BaseHook` validates an exact match on deployment. Flag values from v4-core `Hooks.sol`:
+
+| Flag | Bit | Value |
+|------|-----|-------|
+| `BEFORE_INITIALIZE_FLAG` | 13 | `0x2000` |
+| `AFTER_INITIALIZE_FLAG` | 12 | `0x1000` |
+| `BEFORE_ADD_LIQUIDITY_FLAG` | 11 | `0x0800` |
+| `AFTER_ADD_LIQUIDITY_FLAG` | 10 | `0x0400` |
+| `BEFORE_REMOVE_LIQUIDITY_FLAG` | 9 | `0x0200` |
+| `AFTER_REMOVE_LIQUIDITY_FLAG` | 8 | `0x0100` |
+| `BEFORE_SWAP_FLAG` | 7 | `0x0080` |
+| `AFTER_SWAP_FLAG` | 6 | `0x0040` |
+| `BEFORE_DONATE_FLAG` | 5 | `0x0020` |
+| `AFTER_DONATE_FLAG` | 4 | `0x0010` |
+| `BEFORE_SWAP_RETURNS_DELTA_FLAG` | 3 | `0x0008` |
+| `AFTER_SWAP_RETURNS_DELTA_FLAG` | 2 | `0x0004` |
+| `AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG` | 1 | `0x0002` |
+| `AFTER_REMOVE_LIQUIDITY_RETURNS_DELTA_FLAG` | 0 | `0x0001` |
+
+OR together the flags your hook's `getHookPermissions()` declares. For example, a hook using `beforeSwap` and `afterSwap` needs `0x0080 | 0x0040 = 0x00C0`.
+
+### Example: mining a v4 hook address with a vanity prefix
+
+When deploying via `forge script` with `new MyHook{salt: salt}(...)`, contracts are deployed through the CREATE2 Deployer Proxy at `0x4e59b44847b379578588920cA78FbF26c0B4956C`, which forwards the salt as-is — so use it as the factory and the zero address as the caller:
+
+```sh
+$ export FACTORY="0x4e59b44847b379578588920cA78FbF26c0B4956C"
+$ export CALLER="0x0000000000000000000000000000000000000000"
+$ export INIT_CODE_HASH="<keccak256 of your hook creation code ++ abi-encoded constructor args>"
+$ cargo run --release -- $FACTORY $CALLER $INIT_CODE_HASH --hook-flags 0x00C0 --prefix c0ffee
+```
+
+The 14 flag bits alone cost ~2^14 attempts (instant); each additional vanity prefix character multiplies difficulty by 16. The init code hash covers the constructor arguments too: `keccak256(abi.encodePacked(type(MyHook).creationCode, abi.encode(...)))`. Verify a mined salt before use:
+
+```sh
+$ cast create2 --deployer $FACTORY --salt <salt> --init-code-hash $INIT_CODE_HASH
+```
+
 PRs welcome!

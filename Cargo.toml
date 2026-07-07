@@ -3,11 +3,12 @@ name = "create2crunch"
 version = "0.3.0"
 authors = ["0age <0age@protonmail.com"]
 edition = "2021"
-rust-version = "1.65"
+rust-version = "1.74"
 
 [dependencies]
 alloy-primitives = { version = "0.5", features = ["rand"] }
 byteorder = "1.5"
+clap = { version = "4.5", features = ["derive"] }
 console = "0.15"
 fs4 = "0.7"
 ocl = "0.19"

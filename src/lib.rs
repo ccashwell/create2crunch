@@ -3,6 +3,7 @@
 
 use alloy_primitives::{hex, Address, FixedBytes};
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
+use clap::Parser;
 use console::Term;
 use fs4::FileExt;
 use ocl::{Buffer, Context, Device, MemFlags, Platform, ProQue, Program, Queue};
@@ -29,15 +30,210 @@ const MAX_INCREMENTER: u64 = 0xffffffffffff;
 
 static KERNEL_SRC: &str = include_str!("./kernels/keccak256.cl");
 
-/// Requires three hex-encoded arguments: the address of the contract that will
-/// be calling CREATE2, the address of the caller of said contract *(assuming
-/// the contract calling CREATE2 has frontrunning protection in place - if not
-/// applicable to your use-case you can set it to the null address)*, and the
-/// keccak-256 hash of the bytecode that is provided by the contract calling
-/// CREATE2 that will be used to initialize the new contract. An additional set
-/// of three optional values may be provided: a device to target for OpenCL GPU
-/// search, a threshold for leading zeroes to search for, and a threshold for
-/// total zeroes to search for.
+/// Search for CREATE2 salts that produce gas-efficient or pattern-matching
+/// contract addresses.
+///
+/// By default, addresses are scored by leading/total zero bytes (the classic
+/// create2crunch behavior). Alternatively, provide --prefix, --suffix, and/or
+/// --hook-flags to search for addresses matching an exact bit pattern - for
+/// example, Uniswap v4 hook addresses, which encode their permissions in the
+/// lowest 14 bits of the address and may also carry a vanity prefix.
+#[derive(Parser, Debug)]
+#[command(name = "create2crunch", version)]
+pub struct Args {
+    /// Address of the contract that will call CREATE2 (the factory)
+    #[arg(value_parser = parse_fixed_bytes::<20>)]
+    pub factory: [u8; 20],
+
+    /// Address of the caller of the factory, for factories with frontrunning
+    /// protection (use the zero address if not applicable)
+    #[arg(value_parser = parse_fixed_bytes::<20>)]
+    pub caller: [u8; 20],
+
+    /// Keccak-256 hash of the initialization code of the contract to deploy
+    #[arg(value_parser = parse_fixed_bytes::<32>)]
+    pub init_code_hash: [u8; 32],
+
+    /// OpenCL GPU device to use (255 = CPU)
+    #[arg(default_value_t = 255)]
+    pub gpu_device: u8,
+
+    /// Leading zero-bytes threshold (defaults to 3, or 0 when a pattern is
+    /// given; in pattern mode a non-zero value is ANDed with the pattern)
+    pub leading_zeroes: Option<u8>,
+
+    /// Total zero-bytes threshold (defaults to 5, or disabled when a pattern
+    /// is given; in pattern mode a value of 0..=20 is ANDed with the pattern)
+    pub total_zeroes: Option<u8>,
+
+    /// Require the address to start with this hex string (up to 40 hex
+    /// characters, odd lengths allowed)
+    #[arg(long)]
+    pub prefix: Option<String>,
+
+    /// Require the address to end with this hex string (up to 40 hex
+    /// characters, odd lengths allowed)
+    #[arg(long)]
+    pub suffix: Option<String>,
+
+    /// Uniswap v4 hook permission flags: require address & 0x3fff == FLAGS
+    /// (exact match on all 14 flag bits, hex or decimal)
+    #[arg(long, value_name = "FLAGS", value_parser = parse_hook_flags)]
+    pub hook_flags: Option<u16>,
+}
+
+fn parse_fixed_bytes<const N: usize>(s: &str) -> Result<[u8; N], String> {
+    let bytes = hex::decode(s).map_err(|e| e.to_string())?;
+    bytes
+        .try_into()
+        .map_err(|_| format!("expected {N} bytes ({} hex characters)", N * 2))
+}
+
+fn parse_hook_flags(s: &str) -> Result<u16, String> {
+    let flags = match s.strip_prefix("0x") {
+        Some(hex_str) => u16::from_str_radix(hex_str, 16),
+        None => s.parse::<u16>(),
+    }
+    .map_err(|e| e.to_string())?;
+    if flags > HOOK_FLAG_MASK {
+        return Err(format!(
+            "hook flags must fit in 14 bits (max 0x{HOOK_FLAG_MASK:x})"
+        ));
+    }
+    Ok(flags)
+}
+
+/// Parse a hex string (optionally 0x-prefixed, odd lengths allowed) into
+/// individual nibble values.
+fn parse_nibbles(s: &str, what: &str) -> Result<Vec<u8>, String> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    if s.is_empty() {
+        return Err(format!("{what} pattern is empty"));
+    }
+    if s.len() > 40 {
+        return Err(format!("{what} pattern is longer than 40 hex characters"));
+    }
+    s.chars()
+        .map(|c| {
+            c.to_digit(16)
+                .map(|d| d as u8)
+                .ok_or_else(|| format!("{what} pattern contains non-hex character {c:?}"))
+        })
+        .collect()
+}
+
+/// Uniswap v4 `Hooks.ALL_HOOK_MASK`: hook permissions occupy the lowest 14
+/// bits of the hook address and must match the declared permissions exactly.
+pub const HOOK_FLAG_MASK: u16 = (1 << 14) - 1;
+
+/// A bit-level constraint over a 20-byte address: an address matches when
+/// `address & mask == value` for every byte. Built from vanity prefixes,
+/// suffixes, and/or Uniswap v4 hook permission flags, which may be combined
+/// as long as their fixed bits agree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Pattern {
+    mask: [u8; 20],
+    value: [u8; 20],
+}
+
+impl Pattern {
+    /// Constrain the address to start with the given nibbles.
+    pub fn from_prefix(nibbles: &[u8]) -> Self {
+        let mut pattern = Self::default();
+        for (i, &nibble) in nibbles.iter().enumerate() {
+            pattern.set_nibble(i, nibble);
+        }
+        pattern
+    }
+
+    /// Constrain the address to end with the given nibbles.
+    pub fn from_suffix(nibbles: &[u8]) -> Self {
+        let mut pattern = Self::default();
+        for (i, &nibble) in nibbles.iter().enumerate() {
+            pattern.set_nibble(40 - nibbles.len() + i, nibble);
+        }
+        pattern
+    }
+
+    /// Constrain the lowest 14 bits of the address to exactly equal the given
+    /// Uniswap v4 hook permission flags.
+    pub fn from_hook_flags(flags: u16) -> Self {
+        let mut pattern = Self::default();
+        pattern.mask[18] = (HOOK_FLAG_MASK >> 8) as u8;
+        pattern.mask[19] = 0xff;
+        pattern.value[18] = (flags >> 8) as u8;
+        pattern.value[19] = (flags & 0xff) as u8;
+        pattern
+    }
+
+    fn set_nibble(&mut self, position: usize, nibble: u8) {
+        let byte = position / 2;
+        if position % 2 == 0 {
+            self.mask[byte] |= 0xf0;
+            self.value[byte] |= nibble << 4;
+        } else {
+            self.mask[byte] |= 0x0f;
+            self.value[byte] |= nibble;
+        }
+    }
+
+    /// Combine two patterns, requiring agreement on any overlapping bits.
+    pub fn merge(self, other: Self) -> Result<Self, String> {
+        let mut merged = Self::default();
+        for i in 0..20 {
+            let overlap = self.mask[i] & other.mask[i];
+            if (self.value[i] ^ other.value[i]) & overlap != 0 {
+                return Err(format!(
+                    "conflicting patterns: prefix/suffix/hook-flags disagree on address byte {i}"
+                ));
+            }
+            merged.mask[i] = self.mask[i] | other.mask[i];
+            merged.value[i] = self.value[i] | other.value[i];
+        }
+        Ok(merged)
+    }
+
+    /// Whether the given 20-byte address satisfies this pattern.
+    pub fn matches(&self, address: &[u8]) -> bool {
+        address
+            .iter()
+            .zip(&self.mask)
+            .zip(&self.value)
+            .all(|((&byte, &mask), &value)| byte & mask == value)
+    }
+
+    /// Number of constrained bits; a random address matches with probability
+    /// 2^-bits().
+    pub fn bits(&self) -> u32 {
+        self.mask.iter().map(|m| m.count_ones()).sum()
+    }
+}
+
+/// Renders the pattern as an address template: fixed nibbles as hex digits,
+/// free nibbles as `x`, and partially-constrained nibbles (e.g. the top two
+/// bits of the 14-bit hook flags) as `?`.
+impl std::fmt::Display for Pattern {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "0x")?;
+        for position in 0..40 {
+            let byte = position / 2;
+            let (mask, value) = if position % 2 == 0 {
+                (self.mask[byte] >> 4, self.value[byte] >> 4)
+            } else {
+                (self.mask[byte] & 0xf, self.value[byte] & 0xf)
+            };
+            match mask {
+                0x0 => write!(f, "x")?,
+                0xf => write!(f, "{value:x}")?,
+                _ => write!(f, "?")?,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The resolved search configuration: the CREATE2 inputs plus either the
+/// classic zero-byte thresholds or a bit pattern to match.
 pub struct Config {
     pub factory_address: [u8; 20],
     pub calling_address: [u8; 20],
@@ -45,84 +241,62 @@ pub struct Config {
     pub gpu_device: u8,
     pub leading_zeroes_threshold: u8,
     pub total_zeroes_threshold: u8,
+    pub pattern: Option<Pattern>,
 }
 
-/// Validate the provided arguments and construct the Config struct.
 impl Config {
-    pub fn new(mut args: std::env::Args) -> Result<Self, &'static str> {
-        // get args, skipping first arg (program name)
-        args.next();
+    /// Parse the process arguments (exiting with help/usage on parse errors)
+    /// and validate them into a Config.
+    pub fn parse_args() -> Result<Self, String> {
+        Self::new(Args::parse())
+    }
 
-        let Some(factory_address_string) = args.next() else {
-            return Err("didn't get a factory_address argument");
-        };
-        let Some(calling_address_string) = args.next() else {
-            return Err("didn't get a calling_address argument");
-        };
-        let Some(init_code_hash_string) = args.next() else {
-            return Err("didn't get an init_code_hash argument");
-        };
-
-        let gpu_device_string = match args.next() {
-            Some(arg) => arg,
-            None => String::from("255"), // indicates that CPU will be used.
-        };
-        let leading_zeroes_threshold_string = match args.next() {
-            Some(arg) => arg,
-            None => String::from("3"),
-        };
-        let total_zeroes_threshold_string = match args.next() {
-            Some(arg) => arg,
-            None => String::from("5"),
+    /// Validate the provided arguments and construct the Config struct.
+    pub fn new(args: Args) -> Result<Self, String> {
+        let mut pattern: Option<Pattern> = None;
+        let mut add_pattern = |new: Pattern| -> Result<(), String> {
+            pattern = Some(match pattern.take() {
+                Some(existing) => existing.merge(new)?,
+                None => new,
+            });
+            Ok(())
         };
 
-        // convert main arguments from hex string to vector of bytes
-        let Ok(factory_address_vec) = hex::decode(factory_address_string) else {
-            return Err("could not decode factory address argument");
-        };
-        let Ok(calling_address_vec) = hex::decode(calling_address_string) else {
-            return Err("could not decode calling address argument");
-        };
-        let Ok(init_code_hash_vec) = hex::decode(init_code_hash_string) else {
-            return Err("could not decode initialization code hash argument");
-        };
+        if let Some(prefix) = &args.prefix {
+            add_pattern(Pattern::from_prefix(&parse_nibbles(prefix, "prefix")?))?;
+        }
+        if let Some(suffix) = &args.suffix {
+            add_pattern(Pattern::from_suffix(&parse_nibbles(suffix, "suffix")?))?;
+        }
+        if let Some(flags) = args.hook_flags {
+            add_pattern(Pattern::from_hook_flags(flags))?;
+        }
 
-        // convert from vector to fixed array
-        let Ok(factory_address) = factory_address_vec.try_into() else {
-            return Err("invalid length for factory address argument");
-        };
-        let Ok(calling_address) = calling_address_vec.try_into() else {
-            return Err("invalid length for calling address argument");
-        };
-        let Ok(init_code_hash) = init_code_hash_vec.try_into() else {
-            return Err("invalid length for initialization code hash argument");
-        };
-
-        // convert gpu arguments to u8 values
-        let Ok(gpu_device) = gpu_device_string.parse::<u8>() else {
-            return Err("invalid gpu device value");
-        };
-        let Ok(leading_zeroes_threshold) = leading_zeroes_threshold_string.parse::<u8>() else {
-            return Err("invalid leading zeroes threshold value supplied");
-        };
-        let Ok(total_zeroes_threshold) = total_zeroes_threshold_string.parse::<u8>() else {
-            return Err("invalid total zeroes threshold value supplied");
-        };
+        // in pattern mode the zero-byte thresholds default to disabled;
+        // otherwise keep the classic defaults of 3 leading / 5 total
+        let (leading_default, total_default) = if pattern.is_some() { (0, 255) } else { (3, 5) };
+        let leading_zeroes_threshold = args.leading_zeroes.unwrap_or(leading_default);
+        let total_zeroes_threshold = args.total_zeroes.unwrap_or(total_default);
 
         if leading_zeroes_threshold > 20 {
-            return Err("invalid value for leading zeroes threshold argument. (valid: 0..=20)");
+            return Err(
+                "invalid value for leading zeroes threshold argument. (valid: 0..=20)".into(),
+            );
         }
         if total_zeroes_threshold > 20 && total_zeroes_threshold != 255 {
-            return Err("invalid value for total zeroes threshold argument. (valid: 0..=20 | 255)");
+            return Err(
+                "invalid value for total zeroes threshold argument. (valid: 0..=20 | 255)".into(),
+            );
         }
 
         Ok(Self {
-            factory_address,
-            calling_address,
-            init_code_hash,
-            gpu_device,
+            factory_address: args.factory,
+            calling_address: args.caller,
+            init_code_hash: args.init_code_hash,
+            gpu_device: args.gpu_device,
             leading_zeroes_threshold,
             total_zeroes_threshold,
+            pattern,
         })
     }
 }
@@ -196,19 +370,38 @@ pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
                     }
                 }
 
-                // only proceed if there are at least three zero bytes
-                if total < 3 {
-                    return;
-                }
-
-                // look up the reward amount
                 let key = leading * 20 + total;
-                let reward_amount = rewards.get(&key);
+                let reward_amount = match &config.pattern {
+                    Some(pattern) => {
+                        // pattern mode: require the pattern plus any
+                        // explicitly-provided zero-byte thresholds
+                        if !pattern.matches(&res[12..]) {
+                            return;
+                        }
+                        if (leading.min(20) as u8) < config.leading_zeroes_threshold {
+                            return;
+                        }
+                        if config.total_zeroes_threshold <= 20
+                            && (total as u8) < config.total_zeroes_threshold
+                        {
+                            return;
+                        }
+                        rewards.get(&key)
+                    }
+                    None => {
+                        // only proceed if there are at least three zero bytes
+                        if total < 3 {
+                            return;
+                        }
 
-                // only proceed if an efficient address has been found
-                if reward_amount.is_none() {
-                    return;
-                }
+                        // only proceed if an efficient address has been found
+                        let reward_amount = rewards.get(&key);
+                        if reward_amount.is_none() {
+                            return;
+                        }
+                        reward_amount
+                    }
+                };
 
                 // get the full salt used to create the address
                 let header_hex_string = hex::encode(header);
@@ -423,14 +616,24 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
                 ))?;
 
                 // display information about the current search criteria
-                term.write_line(&format!(
-                    "current search space: {}xxxxxxxx{:08x}\t\t\
-                     threshold: {} leading or {} total zeroes",
-                    hex::encode(salt),
-                    BigEndian::read_u64(&view_buf),
-                    config.leading_zeroes_threshold,
-                    config.total_zeroes_threshold
-                ))?;
+                match &config.pattern {
+                    Some(pattern) => term.write_line(&format!(
+                        "current search space: {}xxxxxxxx{:08x}\t\t\
+                         target pattern: {} (2^{})",
+                        hex::encode(salt),
+                        BigEndian::read_u64(&view_buf),
+                        pattern,
+                        pattern.bits(),
+                    ))?,
+                    None => term.write_line(&format!(
+                        "current search space: {}xxxxxxxx{:08x}\t\t\
+                         threshold: {} leading or {} total zeroes",
+                        hex::encode(salt),
+                        BigEndian::read_u64(&view_buf),
+                        config.leading_zeroes_threshold,
+                        config.total_zeroes_threshold
+                    ))?,
+                }
 
                 // display recently found solutions based on terminal height
                 let rows = if height < 5 { 1 } else { height as usize - 4 };
@@ -507,6 +710,13 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
             // get the address that results from the hash
             let address = <&Address>::try_from(&res[12..]).unwrap();
 
+            // re-verify the pattern on the host before recording the result
+            if let Some(pattern) = &config.pattern {
+                if !pattern.matches(&res[12..]) {
+                    continue;
+                }
+            }
+
             // count total and leading zero bytes
             let mut total = 0;
             let mut leading = 0;
@@ -570,7 +780,179 @@ fn mk_kernel_src(config: &Config) -> String {
     let tz = config.total_zeroes_threshold;
     writeln!(src, "#define TOTAL_ZEROES {tz}").unwrap();
 
+    if let Some(pattern) = &config.pattern {
+        // emit one comparison per constrained byte; bytes with a zero mask
+        // are unconstrained and skipped entirely
+        let conditions = pattern
+            .mask
+            .iter()
+            .zip(&pattern.value)
+            .enumerate()
+            .filter(|(_, (&mask, _))| mask != 0)
+            .map(|(i, (&mask, &value))| {
+                if mask == 0xff {
+                    format!("((d)[{i}] == {value}u)")
+                } else {
+                    format!("(((d)[{i}] & {mask}u) == {value}u)")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" && ");
+        writeln!(src, "#define PATTERN 1").unwrap();
+        writeln!(src, "#define hasPattern(d) ({conditions})").unwrap();
+    }
+
     src.push_str(KERNEL_SRC);
 
     src
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_args() -> Args {
+        Args {
+            factory: [0x11; 20],
+            caller: [0x22; 20],
+            init_code_hash: [0x33; 32],
+            gpu_device: 255,
+            leading_zeroes: None,
+            total_zeroes: None,
+            prefix: None,
+            suffix: None,
+            hook_flags: None,
+        }
+    }
+
+    #[test]
+    fn hook_flags_constrain_lowest_14_bits() {
+        // BEFORE_SWAP (1 << 7) | AFTER_SWAP (1 << 6) | BEFORE_INITIALIZE (1 << 13)
+        let flags = (1u16 << 7) | (1 << 6) | (1 << 13);
+        let pattern = Pattern::from_hook_flags(flags);
+        assert_eq!(pattern.bits(), 14);
+
+        let mut address = [0u8; 20];
+        address[18] = (flags >> 8) as u8;
+        address[19] = (flags & 0xff) as u8;
+        assert!(pattern.matches(&address));
+
+        // the top two bits of byte 18 are outside the 14-bit mask
+        address[18] |= 0xc0;
+        assert!(pattern.matches(&address));
+
+        // any flipped flag bit must reject
+        address[19] ^= 1;
+        assert!(!pattern.matches(&address));
+    }
+
+    #[test]
+    fn prefix_and_suffix_handle_odd_nibble_counts() {
+        let prefix = Pattern::from_prefix(&parse_nibbles("c0ffe", "prefix").unwrap());
+        let suffix = Pattern::from_suffix(&parse_nibbles("abc", "suffix").unwrap());
+
+        let mut address = [0u8; 20];
+        address[0] = 0xc0;
+        address[1] = 0xff;
+        address[2] = 0xe7; // low nibble free
+        address[18] = 0x0a; // high nibble free
+        address[19] = 0xbc;
+        assert!(prefix.matches(&address));
+        assert!(suffix.matches(&address));
+
+        address[2] = 0xd7;
+        assert!(!prefix.matches(&address));
+        address[2] = 0xe7;
+        address[18] = 0x0b;
+        assert!(!suffix.matches(&address));
+    }
+
+    #[test]
+    fn merge_rejects_conflicting_bits_and_accepts_agreement() {
+        let suffix = Pattern::from_suffix(&parse_nibbles("ff", "suffix").unwrap());
+        let flags_conflicting = Pattern::from_hook_flags(0);
+        assert!(suffix.merge(flags_conflicting).is_err());
+
+        let flags_agreeing = Pattern::from_hook_flags(0xff);
+        let merged = suffix.merge(flags_agreeing).unwrap();
+        assert_eq!(merged.bits(), 14);
+    }
+
+    #[test]
+    fn config_defaults_depend_on_mode() {
+        let classic = Config::new(test_args()).unwrap();
+        assert!(classic.pattern.is_none());
+        assert_eq!(classic.leading_zeroes_threshold, 3);
+        assert_eq!(classic.total_zeroes_threshold, 5);
+
+        let mut args = test_args();
+        args.hook_flags = Some(0x2400);
+        let pattern_mode = Config::new(args).unwrap();
+        assert!(pattern_mode.pattern.is_some());
+        assert_eq!(pattern_mode.leading_zeroes_threshold, 0);
+        assert_eq!(pattern_mode.total_zeroes_threshold, 255);
+    }
+
+    #[test]
+    fn config_combines_prefix_and_hook_flags() {
+        let mut args = test_args();
+        args.prefix = Some("0xc0ffee".into());
+        args.hook_flags = Some(0x00c0);
+        let config = Config::new(args).unwrap();
+        let pattern = config.pattern.unwrap();
+        assert_eq!(pattern.bits(), 24 + 14);
+        assert_eq!(
+            pattern.to_string(),
+            "0xc0ffeexxxxxxxxxxxxxxxxxxxxxxxxxxxxxx?0c0"
+        );
+
+        let mut address = [0u8; 20];
+        address[0] = 0xc0;
+        address[1] = 0xff;
+        address[2] = 0xee;
+        address[19] = 0xc0;
+        assert!(pattern.matches(&address));
+    }
+
+    #[test]
+    fn kernel_src_embeds_pattern_conditions() {
+        let mut args = test_args();
+        args.hook_flags = Some(0x2400);
+        let config = Config::new(args).unwrap();
+        let src = mk_kernel_src(&config);
+        assert!(src.contains("#define PATTERN 1"));
+        assert!(src.contains("#define hasPattern(d) ((((d)[18] & 63u) == 36u) && ((d)[19] == 0u))"));
+        assert!(src.contains("#define LEADING_ZEROES 0"));
+        assert!(src.contains("#define TOTAL_ZEROES 255"));
+
+        let classic = Config::new(test_args()).unwrap();
+        assert!(!mk_kernel_src(&classic).contains("#define PATTERN 1"));
+    }
+
+    #[test]
+    fn cli_parses_hook_flags_and_patterns() {
+        use clap::Parser as _;
+        let args = Args::try_parse_from([
+            "create2crunch",
+            "0x0000000000ffe8b47b3e2130213b802212439497",
+            "0x0000000000000000000000000000000000000000",
+            "0x2222222222222222222222222222222222222222222222222222222222222222",
+            "--hook-flags",
+            "0x3fff",
+            "--prefix",
+            "c0ffee",
+        ])
+        .unwrap();
+        assert_eq!(args.hook_flags, Some(0x3fff));
+        assert_eq!(args.gpu_device, 255);
+        assert!(Args::try_parse_from([
+            "create2crunch",
+            "0x0000000000ffe8b47b3e2130213b802212439497",
+            "0x0000000000000000000000000000000000000000",
+            "0x2222222222222222222222222222222222222222222222222222222222222222",
+            "--hook-flags",
+            "0x4000",
+        ])
+        .is_err());
+    }
 }
