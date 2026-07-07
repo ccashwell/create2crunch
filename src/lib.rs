@@ -3,19 +3,19 @@
 
 use alloy_primitives::{hex, Address, FixedBytes};
 use clap::Parser;
-use console::Term;
+use console::{style, Style, Term};
 use fs4::FileExt;
 use keccak_asm::{Digest, Keccak256};
 use ocl::{Buffer, Context, Device, MemFlags, Platform, ProQue, Program, Queue};
 use rand::{thread_rng, Rng};
 use rayon::prelude::*;
-use separator::Separatable;
 use std::error::Error;
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::prelude::*;
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use terminal_size::{terminal_size, Height};
 
 #[cfg(target_arch = "aarch64")]
@@ -28,7 +28,6 @@ pub use reward::Reward;
 // workset size (tweak this!)
 const WORK_SIZE: u32 = 0x4000000; // max. 0x15400000 to abs. max 0xffffffff
 
-const WORK_FACTOR: u128 = (WORK_SIZE as u128) / 1_000_000;
 const CONTROL_CHARACTER: u8 = 0xff;
 const MAX_INCREMENTER: u64 = 0xffffffffffff;
 
@@ -402,9 +401,6 @@ impl Config {
     }
 }
 
-/// Solutions found so far, shared between concurrent miners for display.
-pub type FoundList = Arc<Mutex<Vec<String>>>;
-
 /// Dispatch mining according to the configuration: CPU-only, GPU-only
 /// (OpenCL or Metal), or GPU with CPU mining concurrently on a background
 /// thread (--cpu).
@@ -419,8 +415,10 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         Backend::Auto => cfg!(target_os = "macos"),
     };
 
-    let found_list: Option<FoundList> = config.cpu.then(FoundList::default);
-    if let Some(list) = &found_list {
+    // when also mining on the CPU, share one progress tracker between both
+    // miners so the GPU's display reflects the combined effort; the tracker
+    // is populated with backend/device details by the GPU backend below
+    let shared: Option<Arc<Progress>> = if config.cpu {
         // leave one core free for the GPU host thread
         let threads = std::thread::available_parallelism()
             .map(|n| n.get().saturating_sub(1).max(1))
@@ -430,134 +428,333 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
             .build_global()
             .ok();
 
+        let progress = Arc::new(Progress::new(&config));
         let cpu_config = config.clone();
-        let cpu_list = list.clone();
+        let cpu_progress = progress.clone();
         std::thread::spawn(move || {
-            if let Err(e) = cpu(cpu_config, Some(cpu_list)) {
+            if let Err(e) = cpu(cpu_config, Some(cpu_progress)) {
                 eprintln!("CPU mining error: {e}");
             }
         });
-    }
+        Some(progress)
+    } else {
+        None
+    };
 
     if use_metal {
         #[cfg(target_os = "macos")]
-        return metal_gpu::gpu(config, found_list);
+        return metal_gpu::gpu(config, shared);
         #[cfg(not(target_os = "macos"))]
         return Err("the Metal backend is only available on macOS (use --backend opencl)".into());
     }
 
-    gpu(config, found_list)?;
+    gpu(config, shared)?;
     Ok(())
 }
 
-/// Terminal status display shared by the GPU backends: repaints the screen
-/// at most once per second with runtime, rate, search criteria, and the
-/// most recently found solutions.
-pub(crate) struct StatusDisplay {
-    term: Term,
-    start_time: f64,
-    previous_time: f64,
+/// Shared, thread-safe view of a mining run's progress: total hashes tried,
+/// the solutions found so far, and a static summary of the run configuration
+/// for the status display. One instance is shared between concurrent miners
+/// (GPU + `--cpu`) so a single display can report their combined effort.
+pub struct Progress {
+    hashes: AtomicU64,
+    found: Mutex<Vec<String>>,
+    start: Instant,
+    /// backend and device names, set once the compute device is opened
+    backend: OnceLock<(String, String)>,
+    /// static configuration rows (label, value) rendered in the header
+    config_rows: Vec<(&'static str, String)>,
+    /// the search target/criteria description
+    target: String,
+    /// difficulty in bits, i.e. -log2(probability a random address qualifies)
+    difficulty_bits: f64,
 }
 
-impl StatusDisplay {
-    pub(crate) fn new() -> Self {
+impl Progress {
+    fn new(config: &Config) -> Self {
+        let mut config_rows = vec![
+            (
+                "factory",
+                Address::from(config.factory_address).to_checksum(None),
+            ),
+            (
+                "caller",
+                Address::from(config.calling_address).to_checksum(None),
+            ),
+            (
+                "init hash",
+                format!("0x{}", hex::encode(config.init_code_hash)),
+            ),
+        ];
+        if config.cpu {
+            config_rows.push(("+ cpu", cpu_kernel_label().to_string()));
+        }
+
+        let (target, difficulty_bits) = match &config.pattern {
+            Some(pattern) => (format!("{pattern}"), pattern.bits() as f64),
+            None => {
+                let l = config.leading_zeroes_threshold;
+                let t = config.total_zeroes_threshold;
+                let criteria = if t <= 20 {
+                    format!("\u{2265}{l} leading or \u{2265}{t} total zero bytes")
+                } else {
+                    format!("\u{2265}{l} leading zero bytes")
+                };
+                (criteria, zero_byte_difficulty_bits(l, t))
+            }
+        };
+
         Self {
-            term: Term::stdout(),
-            start_time: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs_f64(),
-            previous_time: 0.0,
+            hashes: AtomicU64::new(0),
+            found: Mutex::new(Vec::new()),
+            start: Instant::now(),
+            backend: OnceLock::new(),
+            config_rows,
+            target,
+            difficulty_bits,
         }
     }
 
-    pub(crate) fn maybe_print(
-        &mut self,
-        config: &Config,
-        found_list: &FoundList,
-        cumulative_nonce: u64,
-        salt: &[u8],
-        nonce_high: u32,
-    ) -> std::io::Result<()> {
-        // we don't want to print too fast
-        let current_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as f64;
-        if current_time - self.previous_time <= 0.99 {
-            return Ok(());
+    /// Record `n` completed hash attempts.
+    fn add_hashes(&self, n: u64) {
+        self.hashes.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Record a found solution (already formatted for both file and display).
+    fn push_found(&self, entry: String) {
+        self.found.lock().unwrap().push(entry);
+    }
+
+    /// Name the backend and device once the compute device is opened.
+    fn set_backend(&self, backend: impl Into<String>, device: impl Into<String>) {
+        let _ = self.backend.set((backend.into(), device.into()));
+    }
+}
+
+/// Owns the terminal and paints [`Progress`] as a live status screen. A run
+/// has exactly one renderer (the GPU host thread, or the CPU reporter
+/// thread), so the windowed-rate state it keeps needs no synchronization.
+pub(crate) struct Renderer {
+    term: Term,
+    progress: Arc<Progress>,
+    last_paint: Option<Instant>,
+    window_start: Instant,
+    window_hashes: u64,
+    rate: f64,
+}
+
+impl Renderer {
+    fn new(progress: Arc<Progress>) -> Self {
+        Self {
+            term: Term::stdout(),
+            progress,
+            last_paint: None,
+            window_start: Instant::now(),
+            window_hashes: 0,
+            rate: 0.0,
         }
-        self.previous_time = current_time;
+    }
+
+    /// Repaint the screen if at least ~1s has elapsed since the last paint.
+    fn tick(&mut self) -> std::io::Result<()> {
+        let now = Instant::now();
+        if let Some(last) = self.last_paint {
+            if now.duration_since(last).as_secs_f64() < 1.0 {
+                return Ok(());
+            }
+        }
+        self.last_paint = Some(now);
+        self.paint(now)
+    }
+
+    fn paint(&mut self, now: Instant) -> std::io::Result<()> {
+        let p = &self.progress;
+        let hashes = p.hashes.load(Ordering::Relaxed);
+        let elapsed = now.duration_since(p.start).as_secs_f64();
+
+        // windowed hash rate, refreshed each paint so it tracks current
+        // throughput rather than the lifetime average
+        let window_secs = now.duration_since(self.window_start).as_secs_f64();
+        if window_secs > 0.0 {
+            self.rate = (hashes - self.window_hashes) as f64 / window_secs;
+        }
+        self.window_start = now;
+        self.window_hashes = hashes;
+        let rate = self.rate;
+
+        // expected work per match and its timing; difficulty_bits can exceed
+        // f64's integer range but 2^bits stays representable up to ~1024 bits
+        let expected_hashes = 2f64.powf(p.difficulty_bits);
+        let found = p.found.lock().unwrap();
+        let dim = Style::new().dim();
+        let label = |s: &str| format!("{:>11}", style(s).dim());
+
+        let mut out = String::new();
+        let rule = "\u{2500}".repeat(64);
+        let _ = writeln!(out, "{}", style(format!("create2crunch {rule}")).cyan());
+
+        // configuration block
+        if let Some((backend, device)) = p.backend.get() {
+            let _ = writeln!(
+                out,
+                "{} {} {}",
+                label("backend"),
+                backend,
+                dim.apply_to(format!("\u{00b7} {device}"))
+            );
+        }
+        for (name, value) in &p.config_rows {
+            let _ = writeln!(out, "{} {}", label(name), value);
+        }
+        let _ = writeln!(
+            out,
+            "{} {}   {}",
+            label("target"),
+            style(&p.target).green(),
+            dim.apply_to(format!("1 in 2^{:.0}", p.difficulty_bits.round()))
+        );
+        let _ = writeln!(out, "{}", dim.apply_to(&rule));
+
+        // live statistics
+        let _ = writeln!(
+            out,
+            "{} {:<22}{} {}",
+            label("elapsed"),
+            fmt_duration(elapsed),
+            label("hashes"),
+            fmt_count(hashes),
+        );
+        let _ = writeln!(
+            out,
+            "{} {:<22}{} {}",
+            label("rate"),
+            style(format!("{:.1} Mh/s", rate / 1e6)).bold(),
+            label("found"),
+            style(found.len().to_string()).bold(),
+        );
+
+        // expected time to the next match, and how "due" the search is
+        let (eta, prob) = if rate > 0.0 {
+            let secs = expected_hashes / rate;
+            // probability of at least one match given hashes tried so far
+            let prob = 1.0 - (-(hashes as f64) / expected_hashes).exp();
+            (fmt_duration(secs), format!("{:.0}%", prob * 100.0))
+        } else {
+            ("\u{2014}".to_string(), "\u{2014}".to_string())
+        };
+        let _ = writeln!(
+            out,
+            "{} {:<22}{} {}",
+            label("avg/match"),
+            eta,
+            label("P(\u{2265}1 hit)"),
+            prob,
+        );
+
+        // recent finds, filling the remaining terminal height
+        let height = terminal_size().map(|(_w, Height(h))| h).unwrap_or(24) as usize;
+        let used = p.config_rows.len() + p.backend.get().is_some() as usize + 6;
+        let rows = height.saturating_sub(used + 1).max(1);
+        if !found.is_empty() {
+            let _ = writeln!(
+                out,
+                "{}",
+                dim.apply_to(format!("recent {}", "\u{2500}".repeat(57)))
+            );
+            let start = found.len().saturating_sub(rows);
+            for entry in &found[start..] {
+                let _ = writeln!(out, "{entry}");
+            }
+        }
 
         self.term.clear_screen()?;
+        self.term.write_str(&out)
+    }
+}
 
-        // get the total runtime and parse into hours : minutes : seconds
-        let total_runtime = current_time - self.start_time;
-        let total_runtime_hrs = total_runtime as u64 / 3600;
-        let total_runtime_mins = (total_runtime as u64 - total_runtime_hrs * 3600) / 60;
-        let total_runtime_secs =
-            total_runtime - (total_runtime_hrs * 3600) as f64 - (total_runtime_mins * 60) as f64;
+/// The label for the CPU hashing path in use on this machine.
+fn cpu_kernel_label() -> &'static str {
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("sha3")
+        && std::env::var_os("CREATE2CRUNCH_FORCE_SCALAR").is_none()
+    {
+        return "2-way SHA3 NEON";
+    }
+    "scalar (CRYPTOGAMS asm)"
+}
 
-        // determine the number of attempts being made per second
-        let work_rate: u128 = WORK_FACTOR * cumulative_nonce as u128;
-        let rate = if total_runtime > 0.0 {
-            1.0 / total_runtime
-        } else {
-            0.0
-        };
-
-        // calculate the terminal height, defaulting to a height of ten rows
-        let height = terminal_size().map(|(_w, Height(h))| h).unwrap_or(10);
-
-        // display information about the total runtime and work size
-        self.term.write_line(&format!(
-            "total runtime: {}:{:02}:{:02} ({} cycles)\t\t\t\
-             work size per cycle: {}",
-            total_runtime_hrs,
-            total_runtime_mins,
-            total_runtime_secs,
-            cumulative_nonce,
-            WORK_SIZE.separated_string(),
-        ))?;
-
-        // display information about the attempt rate and found solutions
-        self.term.write_line(&format!(
-            "rate: {:.2} million attempts per second{}\t\t\t\
-             total found this run: {}",
-            work_rate as f64 * rate,
-            if config.cpu { " (+ CPU mining)" } else { "" },
-            found_list.lock().unwrap().len()
-        ))?;
-
-        // display information about the current search criteria
-        match &config.pattern {
-            Some(pattern) => self.term.write_line(&format!(
-                "current search space: {}xxxxxxxx{:08x}\t\t\
-                 target pattern: {} (2^{})",
-                hex::encode(salt),
-                nonce_high.swap_bytes() as u64,
-                pattern,
-                pattern.bits(),
-            ))?,
-            None => self.term.write_line(&format!(
-                "current search space: {}xxxxxxxx{:08x}\t\t\
-                 threshold: {} leading or {} total zeroes",
-                hex::encode(salt),
-                nonce_high.swap_bytes() as u64,
-                config.leading_zeroes_threshold,
-                config.total_zeroes_threshold
-            ))?,
+/// Approximate difficulty (in bits) of the classic zero-byte criteria
+/// "\u{2265}L leading OR \u{2265}T total zero bytes": -log2 of the probability
+/// that a uniformly random 20-byte address qualifies.
+fn zero_byte_difficulty_bits(leading: u8, total: u8) -> f64 {
+    // P(first L bytes zero) = 256^-L
+    let p_leading = 256f64.powi(-(leading as i32));
+    // P(>=T of 20 bytes zero), binomial tail with p = 1/256
+    let p_total = if total > 20 {
+        0.0
+    } else {
+        let p = 1.0f64 / 256.0;
+        let mut tail = 0.0;
+        for k in total as u32..=20 {
+            let mut term = binomial(20, k) as f64;
+            term *= p.powi(k as i32);
+            term *= (1.0 - p).powi((20 - k) as i32);
+            tail += term;
         }
+        tail
+    };
+    // union bound; the two events overlap negligibly at these probabilities
+    let p = (p_leading + p_total).min(1.0);
+    if p <= 0.0 {
+        f64::INFINITY
+    } else {
+        -p.log2()
+    }
+}
 
-        // display recently found solutions based on terminal height
-        let rows = if height < 5 { 1 } else { height as usize - 4 };
-        let last_rows: Vec<String> = {
-            let found_list = found_list.lock().unwrap();
-            found_list.iter().cloned().rev().take(rows).collect()
-        };
-        let ordered: Vec<String> = last_rows.iter().cloned().rev().collect();
-        let recently_found = &ordered.join("\n");
-        self.term.write_line(recently_found)
+fn binomial(n: u32, k: u32) -> u64 {
+    let k = k.min(n - k);
+    let mut result: u64 = 1;
+    for i in 0..k {
+        result = result * (n - i) as u64 / (i + 1) as u64;
+    }
+    result
+}
+
+/// Format a byte/attempt count with an SI-style suffix (e.g. `1.23 billion`).
+fn fmt_count(n: u64) -> String {
+    const UNITS: [(f64, &str); 4] = [
+        (1e12, "trillion"),
+        (1e9, "billion"),
+        (1e6, "million"),
+        (1e3, "thousand"),
+    ];
+    let f = n as f64;
+    for (scale, name) in UNITS {
+        if f >= scale {
+            return format!("{:.2} {name}", f / scale);
+        }
+    }
+    n.to_string()
+}
+
+/// Format a duration in seconds as a compact human string (e.g. `2h 3m`,
+/// `6m 12s`, `45s`), or an eternity marker for absurdly long estimates.
+fn fmt_duration(secs: f64) -> String {
+    if !secs.is_finite() || secs >= 315_360_000.0 {
+        // >= 10 years: not worth a precise figure
+        return "> 10 years".to_string();
+    }
+    let secs = secs.max(0.0) as u64;
+    let (d, h, m, s) = (secs / 86400, secs / 3600 % 24, secs / 60 % 60, secs % 60);
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
     }
 }
 
@@ -575,12 +772,38 @@ impl StatusDisplay {
 /// address is found, it will be appended to `efficient_addresses.txt` along
 /// with the resultant address and the "value" (i.e. approximate rarity) of the
 /// resultant address.
-pub fn cpu(config: Config, found_list: Option<FoundList>) -> Result<(), Box<dyn Error>> {
+pub fn cpu(config: Config, progress: Option<Arc<Progress>>) -> Result<(), Box<dyn Error>> {
     // (create if necessary) and open a file where found salts will be written
     let file = output_file();
 
     // create object for computing rewards (relative rarity) for a given address
     let rewards = Reward::new();
+
+    // when running standalone, own the progress tracker and paint the status
+    // screen from a background thread; when co-mining, the GPU backend owns
+    // both and this call only feeds hashes/finds into the shared tracker
+    let solo = progress.is_none();
+    let progress = progress.unwrap_or_else(|| {
+        let p = Arc::new(Progress::new(&config));
+        let threads = rayon::current_num_threads();
+        p.set_backend(
+            "CPU",
+            format!("{threads} threads \u{00b7} {}", cpu_kernel_label()),
+        );
+        p
+    });
+    if solo {
+        let reporter = progress.clone();
+        std::thread::spawn(move || {
+            let mut renderer = Renderer::new(reporter);
+            loop {
+                // short sleep so the thread stays responsive; tick() itself
+                // throttles the actual repaint to ~1s
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                let _ = renderer.tick();
+            }
+        });
+    }
 
     // on CPUs with the ARMv8.4 SHA3 extension, hash two candidates per core
     // in the 128-bit NEON registers (CREATE2CRUNCH_FORCE_SCALAR overrides,
@@ -588,10 +811,10 @@ pub fn cpu(config: Config, found_list: Option<FoundList>) -> Result<(), Box<dyn 
     #[cfg(target_arch = "aarch64")]
     let use_x2 = std::arch::is_aarch64_feature_detected!("sha3")
         && std::env::var_os("CREATE2CRUNCH_FORCE_SCALAR").is_none();
-    #[cfg(target_arch = "aarch64")]
-    if use_x2 {
-        println!("CPU: using 2-way SHA3 NEON keccak...");
-    }
+
+    // hashes counted (and the status refreshed) once per chunk to keep the
+    // shared atomic off the innermost loop
+    const CHUNK: u64 = 1 << 16;
 
     // begin searching for addresses
     loop {
@@ -658,11 +881,7 @@ pub fn cpu(config: Config, found_list: Option<FoundList>) -> Result<(), Box<dyn 
                 "{full_salt} => {address} => {}",
                 reward_amount.unwrap_or("0")
             );
-            match &found_list {
-                // concurrent with a GPU miner: report through its display
-                Some(list) => list.lock().unwrap().push(output.clone()),
-                None => println!("{output}"),
-            }
+            progress.push_found(output.clone());
 
             // create a lock on the file before writing
             file.lock_exclusive().expect("Couldn't lock file.");
@@ -674,33 +893,40 @@ pub fn cpu(config: Config, found_list: Option<FoundList>) -> Result<(), Box<dyn 
             file.unlock().expect("Couldn't unlock file.")
         };
 
-        // iterate over a 6-byte nonce, two candidates per NEON keccak call
-        #[cfg(target_arch = "aarch64")]
-        if use_x2 {
-            let lanes = sponge_lanes(&template);
-            (0..MAX_INCREMENTER / 2)
-                .into_par_iter() // parallelization
-                .for_each(|pair| {
+        // process the nonce space in chunks so the hash counter is updated
+        // in bulk rather than per candidate
+        let run_chunk = |chunk: u64| {
+            let base = chunk * CHUNK;
+
+            #[cfg(target_arch = "aarch64")]
+            if use_x2 {
+                let lanes = sponge_lanes(&template);
+                for pair in 0..CHUNK / 2 {
+                    let (salt_a, salt_b) = (base + pair * 2, base + pair * 2 + 1);
                     // SAFETY: gated on runtime detection of the sha3 feature
                     let (address_a, address_b) =
-                        unsafe { keccak_x2::address_pair(&lanes, pair * 2, pair * 2 + 1) };
-                    handle_candidate(pair * 2, &address_a);
-                    handle_candidate(pair * 2 + 1, &address_b);
-                });
-            continue;
-        }
+                        unsafe { keccak_x2::address_pair(&lanes, salt_a, salt_b) };
+                    handle_candidate(salt_a, &address_a);
+                    handle_candidate(salt_b, &address_b);
+                }
+                progress.add_hashes(CHUNK);
+                return;
+            }
 
-        // iterate over a 6-byte nonce and compute each address
-        (0..MAX_INCREMENTER)
-            .into_par_iter() // parallelization
-            .for_each(|salt| {
+            for k in 0..CHUNK {
+                let salt = base + k;
                 // splice the nonce into the message and hash it
                 let mut message = template;
                 message[47..53].copy_from_slice(&salt.to_le_bytes()[..6]);
                 let res = Keccak256::digest(message);
-
                 handle_candidate(salt, &res[12..]);
-            });
+            }
+            progress.add_hashes(CHUNK);
+        };
+
+        (0..MAX_INCREMENTER / CHUNK)
+            .into_par_iter() // parallelization
+            .for_each(run_chunk);
     }
 }
 
@@ -755,20 +981,15 @@ fn sponge_lanes(template: &[u8; 85]) -> [u64; 17] {
 ///
 /// This method is still highly experimental and could almost certainly use
 /// further optimization - contributions are more than welcome!
-pub fn gpu(config: Config, found_list: Option<FoundList>) -> ocl::Result<()> {
-    println!(
-        "Setting up experimental OpenCL miner using device {}...",
-        config.gpu_device
-    );
-
+pub fn gpu(config: Config, progress: Option<Arc<Progress>>) -> ocl::Result<()> {
     // (create if necessary) and open a file where found salts will be written
     let file = output_file();
 
     // create object for computing rewards (relative rarity) for a given address
     let rewards = Reward::new();
 
-    // track found addresses (shared with a concurrent CPU miner when --cpu)
-    let found_list = found_list.unwrap_or_default();
+    // progress tracker (shared with a concurrent CPU miner when --cpu)
+    let progress = progress.unwrap_or_else(|| Arc::new(Progress::new(&config)));
 
     // set up a platform to use
     let platform = Platform::new(ocl::core::default_platform()?);
@@ -784,17 +1005,19 @@ pub fn gpu(config: Config, found_list: Option<FoundList>) -> ocl::Result<()> {
     } else {
         KernelFlavor::OpenCl64
     };
-    println!(
-        "Using the {} keccak kernel...",
-        if use_32bit {
-            "bit-interleaved 32-bit"
-        } else {
-            "64-bit"
-        }
-    );
 
     // set up the device to use
     let device = Device::by_idx_wrap(platform, config.gpu_device as usize)?;
+    progress.set_backend(
+        if use_32bit {
+            "OpenCL (bit-interleaved 32-bit)"
+        } else {
+            "OpenCL (64-bit)"
+        },
+        device
+            .name()
+            .unwrap_or_else(|_| "unknown device".to_string()),
+    );
 
     // set up the context to use
     let context = Context::builder()
@@ -817,9 +1040,8 @@ pub fn gpu(config: Config, found_list: Option<FoundList>) -> ocl::Result<()> {
     // create a random number generator
     let mut rng = thread_rng();
 
-    // set up the terminal status display and performance tracking
-    let mut display = StatusDisplay::new();
-    let mut cumulative_nonce: u64 = 0;
+    // set up the terminal status display
+    let mut renderer = Renderer::new(progress.clone());
 
     // the last work duration in milliseconds
     let mut work_duration_millis: u64 = 0;
@@ -879,11 +1101,9 @@ pub fn gpu(config: Config, found_list: Option<FoundList>) -> ocl::Result<()> {
             // calculate the current time
             let mut now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 
-            // repaint the status screen (at most once per second)
-            display.maybe_print(&config, &found_list, cumulative_nonce, &salt[..], nonce[0])?;
-
-            // increment the cumulative nonce (does not reset after a match)
-            cumulative_nonce += 1;
+            // count this work group and repaint the status (throttled to ~1s)
+            progress.add_hashes(WORK_SIZE as u64);
+            renderer.tick()?;
 
             // record the start time of the work
             let work_start_time_millis = now.as_secs() * 1000 + now.subsec_nanos() as u64 / 1000000;
@@ -922,7 +1142,7 @@ pub fn gpu(config: Config, found_list: Option<FoundList>) -> ocl::Result<()> {
 
         // iterate over each solution, first converting to a fixed array
         for &solution in &solutions {
-            record_solution(&config, &rewards, &file, &found_list, &salt[..], solution);
+            record_solution(&config, &rewards, &file, &progress, &salt[..], solution);
         }
     }
 }
@@ -934,7 +1154,7 @@ pub(crate) fn record_solution(
     config: &Config,
     rewards: &Reward,
     file: &File,
-    found_list: &FoundList,
+    progress: &Progress,
     salt: &[u8],
     solution: u64,
 ) {
@@ -989,7 +1209,7 @@ pub(crate) fn record_solution(
     );
 
     let show = format!("{output} ({leading} / {total})");
-    found_list.lock().unwrap().push(show);
+    progress.push_found(show);
 
     file.lock_exclusive().expect("Couldn't lock file.");
 

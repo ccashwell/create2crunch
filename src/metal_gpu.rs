@@ -8,31 +8,26 @@
 //! sleep-and-poll loop.
 
 use crate::{
-    mk_kernel_src, output_file, record_solution, Config, FoundList, KernelFlavor, Reward,
-    StatusDisplay, WORK_SIZE,
+    mk_kernel_src, output_file, record_solution, Config, KernelFlavor, Progress, Renderer, Reward,
+    WORK_SIZE,
 };
 use alloy_primitives::FixedBytes;
 use metal::{Device, MTLResourceOptions, MTLSize};
 use objc::rc::autoreleasepool;
 use rand::{thread_rng, Rng};
 use std::error::Error;
+use std::sync::Arc;
 
 /// Search for salts on an Apple GPU via Metal. Mirrors the OpenCL `gpu`
 /// loop: an outer loop draws a random 4-byte salt segment, an inner loop
 /// dispatches `WORK_SIZE` hashes per command buffer while stepping the
 /// host nonce word, and any found solution is re-verified on the host and
 /// recorded.
-pub(crate) fn gpu(config: Config, found_list: Option<FoundList>) -> Result<(), Box<dyn Error>> {
+pub(crate) fn gpu(config: Config, progress: Option<Arc<Progress>>) -> Result<(), Box<dyn Error>> {
     let devices = Device::all();
     let device = devices
         .get(config.gpu_device as usize)
         .ok_or_else(|| format!("no Metal device at index {}", config.gpu_device))?;
-    println!(
-        "Setting up Metal miner using device {} ({})...",
-        config.gpu_device,
-        device.name()
-    );
-    println!("Using the bit-interleaved 32-bit keccak kernel...");
 
     // (create if necessary) and open a file where found salts will be written
     let file = output_file();
@@ -40,8 +35,9 @@ pub(crate) fn gpu(config: Config, found_list: Option<FoundList>) -> Result<(), B
     // create object for computing rewards (relative rarity) for a given address
     let rewards = Reward::new();
 
-    // track found addresses (shared with a concurrent CPU miner when --cpu)
-    let found_list = found_list.unwrap_or_default();
+    // progress tracker (shared with a concurrent CPU miner when --cpu)
+    let progress = progress.unwrap_or_else(|| Arc::new(Progress::new(&config)));
+    progress.set_backend("Metal", device.name());
 
     let library = device
         .new_library_with_source(
@@ -70,9 +66,8 @@ pub(crate) fn gpu(config: Config, found_list: Option<FoundList>) -> Result<(), B
     // create a random number generator
     let mut rng = thread_rng();
 
-    // set up the terminal status display and performance tracking
-    let mut display = StatusDisplay::new();
-    let mut cumulative_nonce: u64 = 0;
+    // set up the terminal status display
+    let mut renderer = Renderer::new(progress.clone());
 
     // begin searching for addresses
     loop {
@@ -107,11 +102,9 @@ pub(crate) fn gpu(config: Config, found_list: Option<FoundList>) -> Result<(), B
                 command_buffer.wait_until_completed();
             });
 
-            // increment the cumulative nonce (does not reset after a match)
-            cumulative_nonce += 1;
-
-            // repaint the status screen (at most once per second)
-            display.maybe_print(&config, &found_list, cumulative_nonce, &salt[..], nonce)?;
+            // count this work group and repaint the status (throttled to ~1s)
+            progress.add_hashes(WORK_SIZE as u64);
+            renderer.tick()?;
 
             let solution = unsafe { *(solutions_buffer.contents() as *const u64) };
             if solution != 0 {
@@ -122,6 +115,6 @@ pub(crate) fn gpu(config: Config, found_list: Option<FoundList>) -> Result<(), B
             nonce = nonce.wrapping_add(1);
         };
 
-        record_solution(&config, &rewards, &file, &found_list, &salt[..], solution);
+        record_solution(&config, &rewards, &file, &progress, &salt[..], solution);
     }
 }
