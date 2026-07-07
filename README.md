@@ -29,17 +29,20 @@ Two GPU backends are available, selected with `--backend <auto|opencl|metal>`:
 - **Metal** (default on macOS): drives the kernel through Metal directly. On Apple Silicon this is roughly **10x faster** than going through Apple's deprecated OpenCL-over-Metal shim - same kernel, modern compiler and runtime.
 - **OpenCL** (default elsewhere): the original backend. On Apple platforms it automatically uses a bit-interleaved 32-bit keccak kernel (Apple GPUs have no native 64-bit integer ALUs); override with `--kernel-bits 32|64`.
 
-Add `--cpu` to any GPU run to also mine on all CPU cores simultaneously - the CPU path uses hand-written CRYPTOGAMS assembly (via `keccak-asm`) and is worth another ~40 Mh/s on an M4 Max. Both miners share the display and the output file.
+Add `--cpu` to any GPU run to also mine on all CPU cores simultaneously. On aarch64 CPUs with the ARMv8.4 SHA3 extension (all Apple M-series), the CPU path hashes two candidates at once in the 128-bit NEON registers via the `EOR3`/`RAX1`/`XAR`/`BCAX` instructions - about 2x the throughput of the scalar CRYPTOGAMS assembly path (which is used as the fallback and elsewhere). Both miners share the display and the output file.
 
-Measured on an Apple M4 Max (14-core CPU, 40-core GPU):
+Measured on an Apple M4 Max (14-core CPU, 40-core GPU); GPU figures are cool-state and vary with thermals:
 
 | Configuration | Rate |
 |---|---|
-| CPU only (all cores) | ~42 Mh/s |
+| CPU only, scalar (CRYPTOGAMS asm) | ~71 Mh/s |
+| CPU only, 2-way SHA3 NEON | ~151 Mh/s |
 | GPU, OpenCL backend, 64-bit kernel | ~63 Mh/s |
 | GPU, OpenCL backend, bit-interleaved kernel | ~71 Mh/s |
 | GPU, Metal backend (macOS default) | ~740 Mh/s |
-| GPU Metal + `--cpu` | ~780 Mh/s |
+| GPU Metal + `--cpu` (2-way) | ~770 Mh/s |
+
+The CPU adds its full throughput on top of the GPU; running both, the GPU retains ~85% of its solo rate (shared memory bandwidth), so `--cpu` is close to purely additive.
 
 At ~750 Mh/s, v4 hook flags alone (2^14) are instant, flags + a 4-character vanity prefix (2^30) averages under two seconds, flags + 6 characters (2^38) about six minutes, and flags + 8 characters (2^46) about a day.
 

@@ -18,6 +18,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use terminal_size::{terminal_size, Height};
 
+#[cfg(target_arch = "aarch64")]
+mod keccak_x2;
 #[cfg(target_os = "macos")]
 mod metal_gpu;
 mod reward;
@@ -580,6 +582,17 @@ pub fn cpu(config: Config, found_list: Option<FoundList>) -> Result<(), Box<dyn 
     // create object for computing rewards (relative rarity) for a given address
     let rewards = Reward::new();
 
+    // on CPUs with the ARMv8.4 SHA3 extension, hash two candidates per core
+    // in the 128-bit NEON registers (CREATE2CRUNCH_FORCE_SCALAR overrides,
+    // mainly for benchmarking)
+    #[cfg(target_arch = "aarch64")]
+    let use_x2 = std::arch::is_aarch64_feature_detected!("sha3")
+        && std::env::var_os("CREATE2CRUNCH_FORCE_SCALAR").is_none();
+    #[cfg(target_arch = "aarch64")]
+    if use_x2 {
+        println!("CPU: using 2-way SHA3 NEON keccak...");
+    }
+
     // begin searching for addresses
     loop {
         // message: 0xff ++ factory ++ caller ++ salt_random_segment (47 bytes)
@@ -591,95 +604,134 @@ pub fn cpu(config: Config, found_list: Option<FoundList>) -> Result<(), Box<dyn 
         template[41..47].copy_from_slice(&FixedBytes::<6>::random()[..]);
         template[53..].copy_from_slice(&config.init_code_hash);
 
+        // score one candidate's address and record it if it qualifies;
+        // shared by the scalar and 2-way paths. The cheapest rejection for
+        // the active mode runs first so the hash dominates the hot loop.
+        let handle_candidate = |salt: u64, address_bytes: &[u8]| {
+            let reward_amount = match &config.pattern {
+                Some(pattern) => {
+                    // pattern mode: the masked compare rejects almost every
+                    // candidate on its first differing byte, so check it
+                    // before the zero-byte census
+                    if !pattern.matches(address_bytes) {
+                        return;
+                    }
+                    let (leading, total) = count_zero_bytes(address_bytes);
+                    if (leading.min(20) as u8) < config.leading_zeroes_threshold {
+                        return;
+                    }
+                    if config.total_zeroes_threshold <= 20
+                        && (total as u8) < config.total_zeroes_threshold
+                    {
+                        return;
+                    }
+                    rewards.get(&(leading * 20 + total))
+                }
+                None => {
+                    // zero-byte mode: reject on too few total zeros first
+                    let (leading, total) = count_zero_bytes(address_bytes);
+                    if total < 3 {
+                        return;
+                    }
+
+                    // only proceed if an efficient address has been found
+                    let reward_amount = rewards.get(&(leading * 20 + total));
+                    if reward_amount.is_none() {
+                        return;
+                    }
+                    reward_amount
+                }
+            };
+
+            let address = <&Address>::try_from(address_bytes).unwrap();
+
+            // get the full salt used to create the address
+            let salt_bytes = salt.to_le_bytes();
+            let full_salt = format!(
+                "0x{}{}",
+                hex::encode(&template[21..47]),
+                hex::encode(&salt_bytes[..6])
+            );
+
+            // display the salt and the address.
+            let output = format!(
+                "{full_salt} => {address} => {}",
+                reward_amount.unwrap_or("0")
+            );
+            match &found_list {
+                // concurrent with a GPU miner: report through its display
+                Some(list) => list.lock().unwrap().push(output.clone()),
+                None => println!("{output}"),
+            }
+
+            // create a lock on the file before writing
+            file.lock_exclusive().expect("Couldn't lock file.");
+
+            // write the result to file
+            writeln!(&file, "{output}").expect("Couldn't write to `efficient_addresses.txt` file.");
+
+            // release the file lock
+            file.unlock().expect("Couldn't unlock file.")
+        };
+
+        // iterate over a 6-byte nonce, two candidates per NEON keccak call
+        #[cfg(target_arch = "aarch64")]
+        if use_x2 {
+            let lanes = sponge_lanes(&template);
+            (0..MAX_INCREMENTER / 2)
+                .into_par_iter() // parallelization
+                .for_each(|pair| {
+                    // SAFETY: gated on runtime detection of the sha3 feature
+                    let (address_a, address_b) =
+                        unsafe { keccak_x2::address_pair(&lanes, pair * 2, pair * 2 + 1) };
+                    handle_candidate(pair * 2, &address_a);
+                    handle_candidate(pair * 2 + 1, &address_b);
+                });
+            continue;
+        }
+
         // iterate over a 6-byte nonce and compute each address
         (0..MAX_INCREMENTER)
             .into_par_iter() // parallelization
             .for_each(|salt| {
-                let salt = salt.to_le_bytes();
-                let salt_incremented_segment = &salt[..6];
-
                 // splice the nonce into the message and hash it
                 let mut message = template;
-                message[47..53].copy_from_slice(salt_incremented_segment);
+                message[47..53].copy_from_slice(&salt.to_le_bytes()[..6]);
                 let res = Keccak256::digest(message);
 
-                // get the address that results from the hash
-                let address = <&Address>::try_from(&res[12..]).unwrap();
-
-                // count total and leading zero bytes
-                let mut total = 0;
-                let mut leading = 21;
-                for (i, &b) in address.iter().enumerate() {
-                    if b == 0 {
-                        total += 1;
-                    } else if leading == 21 {
-                        // set leading on finding non-zero byte
-                        leading = i;
-                    }
-                }
-
-                let key = leading * 20 + total;
-                let reward_amount = match &config.pattern {
-                    Some(pattern) => {
-                        // pattern mode: require the pattern plus any
-                        // explicitly-provided zero-byte thresholds
-                        if !pattern.matches(&res[12..]) {
-                            return;
-                        }
-                        if (leading.min(20) as u8) < config.leading_zeroes_threshold {
-                            return;
-                        }
-                        if config.total_zeroes_threshold <= 20
-                            && (total as u8) < config.total_zeroes_threshold
-                        {
-                            return;
-                        }
-                        rewards.get(&key)
-                    }
-                    None => {
-                        // only proceed if there are at least three zero bytes
-                        if total < 3 {
-                            return;
-                        }
-
-                        // only proceed if an efficient address has been found
-                        let reward_amount = rewards.get(&key);
-                        if reward_amount.is_none() {
-                            return;
-                        }
-                        reward_amount
-                    }
-                };
-
-                // get the full salt used to create the address
-                let full_salt = format!(
-                    "0x{}{}",
-                    hex::encode(&template[21..47]),
-                    hex::encode(salt_incremented_segment)
-                );
-
-                // display the salt and the address.
-                let output = format!(
-                    "{full_salt} => {address} => {}",
-                    reward_amount.unwrap_or("0")
-                );
-                match &found_list {
-                    // concurrent with a GPU miner: report through its display
-                    Some(list) => list.lock().unwrap().push(output.clone()),
-                    None => println!("{output}"),
-                }
-
-                // create a lock on the file before writing
-                file.lock_exclusive().expect("Couldn't lock file.");
-
-                // write the result to file
-                writeln!(&file, "{output}")
-                    .expect("Couldn't write to `efficient_addresses.txt` file.");
-
-                // release the file lock
-                file.unlock().expect("Couldn't unlock file.")
+                handle_candidate(salt, &res[12..]);
             });
     }
+}
+
+/// Count leading and total zero bytes of a 20-byte address. `leading` is 21
+/// for the all-zero address (matching the original sentinel).
+fn count_zero_bytes(address: &[u8]) -> (usize, usize) {
+    let mut total = 0;
+    let mut leading = 21;
+    for (i, &b) in address.iter().enumerate() {
+        if b == 0 {
+            total += 1;
+        } else if leading == 21 {
+            leading = i;
+        }
+    }
+    (leading, total)
+}
+
+/// The 17 rate lanes of the keccak sponge for the padded 85-byte miner
+/// message (capacity lanes 17..=24 are zero).
+#[cfg(target_arch = "aarch64")]
+fn sponge_lanes(template: &[u8; 85]) -> [u64; 17] {
+    let mut block = [0u8; 136];
+    block[..85].copy_from_slice(template);
+    block[85] = 0x01; // keccak-256 padding start
+    block[135] = 0x80; // keccak-256 padding end
+    let mut lanes = [0u64; 17];
+    for (j, lane) in lanes.iter_mut().enumerate() {
+        *lane = u64::from_le_bytes(block[8 * j..8 * j + 8].try_into().unwrap());
+    }
+    lanes
 }
 
 /// Given a Config object with a factory address, a caller address, a keccak-256
