@@ -2,7 +2,6 @@
 #![deny(unused_must_use, rust_2018_idioms)]
 
 use alloy_primitives::{hex, Address, FixedBytes};
-use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use clap::Parser;
 use console::Term;
 use fs4::FileExt;
@@ -19,6 +18,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use terminal_size::{terminal_size, Height};
 
+#[cfg(target_os = "macos")]
+mod metal_gpu;
 mod reward;
 pub use reward::Reward;
 
@@ -30,7 +31,19 @@ const CONTROL_CHARACTER: u8 = 0xff;
 const MAX_INCREMENTER: u64 = 0xffffffffffff;
 
 static KERNEL_SRC: &str = include_str!("./kernels/keccak256.cl");
+static KERNEL_BI_CORE: &str = include_str!("./kernels/keccak_bi_core.cl");
 static KERNEL_SRC_32: &str = include_str!("./kernels/keccak256_32.cl");
+static KERNEL_SRC_MSL: &str = include_str!("./kernels/keccak256_32.metal");
+
+/// Which GPU kernel to generate: the original 64-bit OpenCL kernel, the
+/// bit-interleaved 32-bit OpenCL kernel, or the Metal (MSL) port of the
+/// bit-interleaved kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KernelFlavor {
+    OpenCl64,
+    OpenCl32,
+    Metal,
+}
 
 /// Keccak-f[1600] round constants. Only the first 23 are used by the kernels;
 /// the final round is computed partially and skips iota.
@@ -132,9 +145,25 @@ pub struct Args {
     pub cpu: bool,
 
     /// GPU kernel word size: 32 uses a bit-interleaved keccak for GPUs
-    /// without native 64-bit integer ALUs (auto-selected on Apple)
+    /// without native 64-bit integer ALUs (auto-selected on Apple; OpenCL
+    /// backend only - Metal always uses the bit-interleaved kernel)
     #[arg(long, value_parser = parse_kernel_bits)]
     pub kernel_bits: Option<u8>,
+
+    /// GPU backend to use
+    #[arg(long, value_enum, default_value_t = Backend::Auto)]
+    pub backend: Backend,
+}
+
+/// GPU compute backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Backend {
+    /// Metal on macOS, OpenCL elsewhere
+    Auto,
+    /// OpenCL
+    Opencl,
+    /// Native Metal (macOS only)
+    Metal,
 }
 
 fn parse_kernel_bits(s: &str) -> Result<u8, String> {
@@ -308,6 +337,7 @@ pub struct Config {
     pub pattern: Option<Pattern>,
     pub cpu: bool,
     pub kernel_bits: Option<u8>,
+    pub backend: Backend,
 }
 
 impl Config {
@@ -365,6 +395,7 @@ impl Config {
             pattern,
             cpu: args.cpu,
             kernel_bits: args.kernel_bits,
+            backend: args.backend,
         })
     }
 }
@@ -372,12 +403,19 @@ impl Config {
 /// Solutions found so far, shared between concurrent miners for display.
 pub type FoundList = Arc<Mutex<Vec<String>>>;
 
-/// Dispatch mining according to the configuration: CPU-only, GPU-only, or
-/// GPU with CPU mining concurrently on a background thread (--cpu).
+/// Dispatch mining according to the configuration: CPU-only, GPU-only
+/// (OpenCL or Metal), or GPU with CPU mining concurrently on a background
+/// thread (--cpu).
 pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     if config.gpu_device == 255 {
         return cpu(config, None);
     }
+
+    let use_metal = match config.backend {
+        Backend::Metal => true,
+        Backend::Opencl => false,
+        Backend::Auto => cfg!(target_os = "macos"),
+    };
 
     let found_list: Option<FoundList> = config.cpu.then(FoundList::default);
     if let Some(list) = &found_list {
@@ -399,8 +437,126 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         });
     }
 
+    if use_metal {
+        #[cfg(target_os = "macos")]
+        return metal_gpu::gpu(config, found_list);
+        #[cfg(not(target_os = "macos"))]
+        return Err("the Metal backend is only available on macOS (use --backend opencl)".into());
+    }
+
     gpu(config, found_list)?;
     Ok(())
+}
+
+/// Terminal status display shared by the GPU backends: repaints the screen
+/// at most once per second with runtime, rate, search criteria, and the
+/// most recently found solutions.
+pub(crate) struct StatusDisplay {
+    term: Term,
+    start_time: f64,
+    previous_time: f64,
+}
+
+impl StatusDisplay {
+    pub(crate) fn new() -> Self {
+        Self {
+            term: Term::stdout(),
+            start_time: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64(),
+            previous_time: 0.0,
+        }
+    }
+
+    pub(crate) fn maybe_print(
+        &mut self,
+        config: &Config,
+        found_list: &FoundList,
+        cumulative_nonce: u64,
+        salt: &[u8],
+        nonce_high: u32,
+    ) -> std::io::Result<()> {
+        // we don't want to print too fast
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as f64;
+        if current_time - self.previous_time <= 0.99 {
+            return Ok(());
+        }
+        self.previous_time = current_time;
+
+        self.term.clear_screen()?;
+
+        // get the total runtime and parse into hours : minutes : seconds
+        let total_runtime = current_time - self.start_time;
+        let total_runtime_hrs = total_runtime as u64 / 3600;
+        let total_runtime_mins = (total_runtime as u64 - total_runtime_hrs * 3600) / 60;
+        let total_runtime_secs =
+            total_runtime - (total_runtime_hrs * 3600) as f64 - (total_runtime_mins * 60) as f64;
+
+        // determine the number of attempts being made per second
+        let work_rate: u128 = WORK_FACTOR * cumulative_nonce as u128;
+        let rate = if total_runtime > 0.0 {
+            1.0 / total_runtime
+        } else {
+            0.0
+        };
+
+        // calculate the terminal height, defaulting to a height of ten rows
+        let height = terminal_size().map(|(_w, Height(h))| h).unwrap_or(10);
+
+        // display information about the total runtime and work size
+        self.term.write_line(&format!(
+            "total runtime: {}:{:02}:{:02} ({} cycles)\t\t\t\
+             work size per cycle: {}",
+            total_runtime_hrs,
+            total_runtime_mins,
+            total_runtime_secs,
+            cumulative_nonce,
+            WORK_SIZE.separated_string(),
+        ))?;
+
+        // display information about the attempt rate and found solutions
+        self.term.write_line(&format!(
+            "rate: {:.2} million attempts per second{}\t\t\t\
+             total found this run: {}",
+            work_rate as f64 * rate,
+            if config.cpu { " (+ CPU mining)" } else { "" },
+            found_list.lock().unwrap().len()
+        ))?;
+
+        // display information about the current search criteria
+        match &config.pattern {
+            Some(pattern) => self.term.write_line(&format!(
+                "current search space: {}xxxxxxxx{:08x}\t\t\
+                 target pattern: {} (2^{})",
+                hex::encode(salt),
+                nonce_high.swap_bytes() as u64,
+                pattern,
+                pattern.bits(),
+            ))?,
+            None => self.term.write_line(&format!(
+                "current search space: {}xxxxxxxx{:08x}\t\t\
+                 threshold: {} leading or {} total zeroes",
+                hex::encode(salt),
+                nonce_high.swap_bytes() as u64,
+                config.leading_zeroes_threshold,
+                config.total_zeroes_threshold
+            ))?,
+        }
+
+        // display recently found solutions based on terminal height
+        let rows = if height < 5 { 1 } else { height as usize - 4 };
+        let last_rows: Vec<String> = {
+            let found_list = found_list.lock().unwrap();
+            found_list.iter().cloned().rev().take(rows).collect()
+        };
+        let ordered: Vec<String> = last_rows.iter().cloned().rev().collect();
+        let recently_found = &ordered.join("\n");
+        self.term.write_line(recently_found)
+    }
 }
 
 /// Given a Config object with a factory address, a caller address, and a
@@ -562,9 +718,6 @@ pub fn gpu(config: Config, found_list: Option<FoundList>) -> ocl::Result<()> {
     // track found addresses (shared with a concurrent CPU miner when --cpu)
     let found_list = found_list.unwrap_or_default();
 
-    // set up a controller for terminal output
-    let term = Term::stdout();
-
     // set up a platform to use
     let platform = Platform::new(ocl::core::default_platform()?);
 
@@ -573,6 +726,11 @@ pub fn gpu(config: Config, found_list: Option<FoundList>) -> ocl::Result<()> {
     let use_32bit = match config.kernel_bits {
         Some(bits) => bits == 32,
         None => platform.name()?.contains("Apple"),
+    };
+    let flavor = if use_32bit {
+        KernelFlavor::OpenCl32
+    } else {
+        KernelFlavor::OpenCl64
     };
     println!(
         "Using the {} keccak kernel...",
@@ -595,7 +753,7 @@ pub fn gpu(config: Config, found_list: Option<FoundList>) -> ocl::Result<()> {
     // set up the program to use
     let program = Program::builder()
         .devices(device)
-        .src(mk_kernel_src(&config, use_32bit))
+        .src(mk_kernel_src(&config, flavor))
         .build(&context)?;
 
     // set up the queue to use
@@ -607,18 +765,9 @@ pub fn gpu(config: Config, found_list: Option<FoundList>) -> ocl::Result<()> {
     // create a random number generator
     let mut rng = thread_rng();
 
-    // determine the start time
-    let start_time: f64 = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs_f64();
-
-    // set up variables for tracking performance
-    let mut rate: f64 = 0.0;
+    // set up the terminal status display and performance tracking
+    let mut display = StatusDisplay::new();
     let mut cumulative_nonce: u64 = 0;
-
-    // the previous timestamp of printing to the terminal
-    let mut previous_time: f64 = 0.0;
 
     // the last work duration in milliseconds
     let mut work_duration_millis: u64 = 0;
@@ -636,10 +785,9 @@ pub fn gpu(config: Config, found_list: Option<FoundList>) -> ocl::Result<()> {
             .copy_host_slice(&salt[..])
             .build()?;
 
-        // reset nonce & create a buffer to view it in little-endian
-        // for more uniformly distributed nonces, we shall initialize it to a random value
+        // reset the nonce; for more uniformly distributed nonces, we shall
+        // initialize it to a random value
         let mut nonce: [u32; 1] = rng.gen();
-        let mut view_buf = [0; 8];
 
         // build a corresponding buffer for passing the nonce to the kernel
         let mut nonce_buffer = Buffer::builder()
@@ -678,86 +826,9 @@ pub fn gpu(config: Config, found_list: Option<FoundList>) -> ocl::Result<()> {
 
             // calculate the current time
             let mut now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-            let current_time = now.as_secs() as f64;
 
-            // we don't want to print too fast
-            let print_output = current_time - previous_time > 0.99;
-            previous_time = current_time;
-
-            // clear the terminal screen
-            if print_output {
-                term.clear_screen()?;
-
-                // get the total runtime and parse into hours : minutes : seconds
-                let total_runtime = current_time - start_time;
-                let total_runtime_hrs = total_runtime as u64 / 3600;
-                let total_runtime_mins = (total_runtime as u64 - total_runtime_hrs * 3600) / 60;
-                let total_runtime_secs = total_runtime
-                    - (total_runtime_hrs * 3600) as f64
-                    - (total_runtime_mins * 60) as f64;
-
-                // determine the number of attempts being made per second
-                let work_rate: u128 = WORK_FACTOR * cumulative_nonce as u128;
-                if total_runtime > 0.0 {
-                    rate = 1.0 / total_runtime;
-                }
-
-                // fill the buffer for viewing the properly-formatted nonce
-                LittleEndian::write_u64(&mut view_buf, (nonce[0] as u64) << 32);
-
-                // calculate the terminal height, defaulting to a height of ten rows
-                let height = terminal_size().map(|(_w, Height(h))| h).unwrap_or(10);
-
-                // display information about the total runtime and work size
-                term.write_line(&format!(
-                    "total runtime: {}:{:02}:{:02} ({} cycles)\t\t\t\
-                     work size per cycle: {}",
-                    total_runtime_hrs,
-                    total_runtime_mins,
-                    total_runtime_secs,
-                    cumulative_nonce,
-                    WORK_SIZE.separated_string(),
-                ))?;
-
-                // display information about the attempt rate and found solutions
-                term.write_line(&format!(
-                    "rate: {:.2} million attempts per second{}\t\t\t\
-                     total found this run: {}",
-                    work_rate as f64 * rate,
-                    if config.cpu { " (+ CPU mining)" } else { "" },
-                    found_list.lock().unwrap().len()
-                ))?;
-
-                // display information about the current search criteria
-                match &config.pattern {
-                    Some(pattern) => term.write_line(&format!(
-                        "current search space: {}xxxxxxxx{:08x}\t\t\
-                         target pattern: {} (2^{})",
-                        hex::encode(salt),
-                        BigEndian::read_u64(&view_buf),
-                        pattern,
-                        pattern.bits(),
-                    ))?,
-                    None => term.write_line(&format!(
-                        "current search space: {}xxxxxxxx{:08x}\t\t\
-                         threshold: {} leading or {} total zeroes",
-                        hex::encode(salt),
-                        BigEndian::read_u64(&view_buf),
-                        config.leading_zeroes_threshold,
-                        config.total_zeroes_threshold
-                    ))?,
-                }
-
-                // display recently found solutions based on terminal height
-                let rows = if height < 5 { 1 } else { height as usize - 4 };
-                let last_rows: Vec<String> = {
-                    let found_list = found_list.lock().unwrap();
-                    found_list.iter().cloned().rev().take(rows).collect()
-                };
-                let ordered: Vec<String> = last_rows.iter().cloned().rev().collect();
-                let recently_found = &ordered.join("\n");
-                term.write_line(recently_found)?;
-            }
+            // repaint the status screen (at most once per second)
+            display.maybe_print(&config, &found_list, cumulative_nonce, &salt[..], nonce[0])?;
 
             // increment the cumulative nonce (does not reset after a match)
             cumulative_nonce += 1;
@@ -799,66 +870,80 @@ pub fn gpu(config: Config, found_list: Option<FoundList>) -> ocl::Result<()> {
 
         // iterate over each solution, first converting to a fixed array
         for &solution in &solutions {
-            if solution == 0 {
-                continue;
-            }
-
-            let solution = solution.to_le_bytes();
-
-            let mut solution_message = [0; 85];
-            solution_message[0] = CONTROL_CHARACTER;
-            solution_message[1..21].copy_from_slice(&config.factory_address);
-            solution_message[21..41].copy_from_slice(&config.calling_address);
-            solution_message[41..45].copy_from_slice(&salt[..]);
-            solution_message[45..53].copy_from_slice(&solution);
-            solution_message[53..].copy_from_slice(&config.init_code_hash);
-
-            // hash the payload and get the result
-            let res = Keccak256::digest(solution_message);
-
-            // get the address that results from the hash
-            let address = <&Address>::try_from(&res[12..]).unwrap();
-
-            // re-verify the pattern on the host before recording the result
-            if let Some(pattern) = &config.pattern {
-                if !pattern.matches(&res[12..]) {
-                    continue;
-                }
-            }
-
-            // count total and leading zero bytes
-            let mut total = 0;
-            let mut leading = 0;
-            for (i, &b) in address.iter().enumerate() {
-                if b == 0 {
-                    total += 1;
-                } else if leading == 0 {
-                    // set leading on finding non-zero byte
-                    leading = i;
-                }
-            }
-
-            let key = leading * 20 + total;
-            let reward = rewards.get(&key).unwrap_or("0");
-            let output = format!(
-                "0x{}{}{} => {} => {}",
-                hex::encode(config.calling_address),
-                hex::encode(salt),
-                hex::encode(solution),
-                address,
-                reward,
-            );
-
-            let show = format!("{output} ({leading} / {total})");
-            found_list.lock().unwrap().push(show);
-
-            file.lock_exclusive().expect("Couldn't lock file.");
-
-            writeln!(&file, "{output}").expect("Couldn't write to `efficient_addresses.txt` file.");
-
-            file.unlock().expect("Couldn't unlock file.");
+            record_solution(&config, &rewards, &file, &found_list, &salt[..], solution);
         }
     }
+}
+
+/// Recompute the address for a GPU-found nonce, re-verify it on the host,
+/// and record it to the found list and the output file. Shared between the
+/// OpenCL and Metal backends.
+pub(crate) fn record_solution(
+    config: &Config,
+    rewards: &Reward,
+    file: &File,
+    found_list: &FoundList,
+    salt: &[u8],
+    solution: u64,
+) {
+    if solution == 0 {
+        return;
+    }
+
+    let solution = solution.to_le_bytes();
+
+    let mut solution_message = [0; 85];
+    solution_message[0] = CONTROL_CHARACTER;
+    solution_message[1..21].copy_from_slice(&config.factory_address);
+    solution_message[21..41].copy_from_slice(&config.calling_address);
+    solution_message[41..45].copy_from_slice(salt);
+    solution_message[45..53].copy_from_slice(&solution);
+    solution_message[53..].copy_from_slice(&config.init_code_hash);
+
+    // hash the payload and get the result
+    let res = Keccak256::digest(solution_message);
+
+    // get the address that results from the hash
+    let address = <&Address>::try_from(&res[12..]).unwrap();
+
+    // re-verify the pattern on the host before recording the result
+    if let Some(pattern) = &config.pattern {
+        if !pattern.matches(&res[12..]) {
+            return;
+        }
+    }
+
+    // count total and leading zero bytes
+    let mut total = 0;
+    let mut leading = 0;
+    for (i, &b) in address.iter().enumerate() {
+        if b == 0 {
+            total += 1;
+        } else if leading == 0 {
+            // set leading on finding non-zero byte
+            leading = i;
+        }
+    }
+
+    let key = leading * 20 + total;
+    let reward = rewards.get(&key).unwrap_or("0");
+    let output = format!(
+        "0x{}{}{} => {} => {}",
+        hex::encode(config.calling_address),
+        hex::encode(salt),
+        hex::encode(solution),
+        address,
+        reward,
+    );
+
+    let show = format!("{output} ({leading} / {total})");
+    found_list.lock().unwrap().push(show);
+
+    file.lock_exclusive().expect("Couldn't lock file.");
+
+    writeln!(&*file, "{output}").expect("Couldn't write to `efficient_addresses.txt` file.");
+
+    file.unlock().expect("Couldn't unlock file.");
 }
 
 #[track_caller]
@@ -871,11 +956,10 @@ fn output_file() -> File {
         .expect("Could not create or open `efficient_addresses.txt` file.")
 }
 
-/// Creates the OpenCL kernel source code by populating the template with the
-/// values from the Config object. `use_32bit` selects the bit-interleaved
-/// keccak kernel for GPUs without native 64-bit integer ALUs.
-fn mk_kernel_src(config: &Config, use_32bit: bool) -> String {
-    let mut src = String::with_capacity(4096 + KERNEL_SRC.len().max(KERNEL_SRC_32.len()));
+/// Creates the GPU kernel source code (OpenCL C or MSL, per the flavor) by
+/// populating the template with the values from the Config object.
+fn mk_kernel_src(config: &Config, flavor: KernelFlavor) -> String {
+    let mut src = String::with_capacity(8192 + KERNEL_SRC.len().max(KERNEL_BI_CORE.len()));
 
     let factory = config.factory_address.iter();
     let caller = config.calling_address.iter();
@@ -911,38 +995,50 @@ fn mk_kernel_src(config: &Config, use_32bit: bool) -> String {
         writeln!(src, "#define hasPattern(d) ({conditions})").unwrap();
     }
 
-    if use_32bit {
-        // the sponge template with all compile-time-constant bytes in place;
-        // bytes 41..53 (salt_random_segment and nonce) are set per work item
-        let mut template = [0u8; 136];
-        template[0] = CONTROL_CHARACTER;
-        template[1..21].copy_from_slice(&config.factory_address);
-        template[21..41].copy_from_slice(&config.calling_address);
-        template[53..85].copy_from_slice(&config.init_code_hash);
-        template[85] = 0x01; // keccak-256 padding start
-        template[135] = 0x80; // keccak-256 padding end
-
-        // lanes 5 and 6 hold the per-work-item bytes and are assembled in the
-        // kernel; lanes 11..=15 and 17..=24 are zero
-        for i in [0usize, 1, 2, 3, 4, 7, 8, 9, 10, 16] {
-            let lane = u64::from_le_bytes(template[8 * i..8 * i + 8].try_into().unwrap());
-            let (even, odd) = bit_interleave(lane);
-            writeln!(src, "#define A{i}_E {even}u").unwrap();
-            writeln!(src, "#define A{i}_O {odd}u").unwrap();
-        }
-
-        // pre-interleaved iota round constants (the partial 24th round needs
-        // no iota, so only 23 are emitted)
-        for (i, rc) in KECCAK_RC.iter().enumerate().take(23) {
-            let (even, odd) = bit_interleave(*rc);
-            writeln!(src, "#define RC{i}_E {even}u").unwrap();
-            writeln!(src, "#define RC{i}_O {odd}u").unwrap();
-        }
-
-        src.push_str(KERNEL_SRC_32);
-    } else {
+    if flavor == KernelFlavor::OpenCl64 {
         src.push_str(KERNEL_SRC);
+        return src;
     }
+
+    // the sponge template with all compile-time-constant bytes in place;
+    // bytes 41..53 (salt_random_segment and nonce) are set per work item
+    let mut template = [0u8; 136];
+    template[0] = CONTROL_CHARACTER;
+    template[1..21].copy_from_slice(&config.factory_address);
+    template[21..41].copy_from_slice(&config.calling_address);
+    template[53..85].copy_from_slice(&config.init_code_hash);
+    template[85] = 0x01; // keccak-256 padding start
+    template[135] = 0x80; // keccak-256 padding end
+
+    // lanes 5 and 6 hold the per-work-item bytes and are assembled in the
+    // kernel; lanes 11..=15 and 17..=24 are zero
+    for i in [0usize, 1, 2, 3, 4, 7, 8, 9, 10, 16] {
+        let lane = u64::from_le_bytes(template[8 * i..8 * i + 8].try_into().unwrap());
+        let (even, odd) = bit_interleave(lane);
+        writeln!(src, "#define A{i}_E {even}u").unwrap();
+        writeln!(src, "#define A{i}_O {odd}u").unwrap();
+    }
+
+    // pre-interleaved iota round constants (the partial 24th round needs
+    // no iota, so only 23 are emitted)
+    for (i, rc) in KECCAK_RC.iter().enumerate().take(23) {
+        let (even, odd) = bit_interleave(*rc);
+        writeln!(src, "#define RC{i}_E {even}u").unwrap();
+        writeln!(src, "#define RC{i}_O {odd}u").unwrap();
+    }
+
+    // splice the shared bit-interleaved core into the per-API wrapper
+    let wrapper = match flavor {
+        KernelFlavor::OpenCl32 => KERNEL_SRC_32,
+        KernelFlavor::Metal => KERNEL_SRC_MSL,
+        KernelFlavor::OpenCl64 => unreachable!(),
+    };
+    let (prelude, entry) = wrapper
+        .split_once("//__CORE__//")
+        .expect("kernel wrapper is missing the //__CORE__// marker");
+    src.push_str(prelude);
+    src.push_str(KERNEL_BI_CORE);
+    src.push_str(entry);
 
     src
 }
@@ -964,6 +1060,7 @@ mod tests {
             hook_flags: None,
             cpu: false,
             kernel_bits: None,
+            backend: Backend::Auto,
         }
     }
 
@@ -1116,14 +1213,14 @@ mod tests {
         let mut args = test_args();
         args.hook_flags = Some(0x2400);
         let config = Config::new(args).unwrap();
-        let src = mk_kernel_src(&config, false);
+        let src = mk_kernel_src(&config, KernelFlavor::OpenCl64);
         assert!(src.contains("#define PATTERN 1"));
         assert!(src.contains("#define hasPattern(d) ((((d)[18] & 63u) == 36u) && ((d)[19] == 0u))"));
         assert!(src.contains("#define LEADING_ZEROES 0"));
         assert!(src.contains("#define TOTAL_ZEROES 255"));
 
         let classic = Config::new(test_args()).unwrap();
-        assert!(!mk_kernel_src(&classic, false).contains("#define PATTERN 1"));
+        assert!(!mk_kernel_src(&classic, KernelFlavor::OpenCl64).contains("#define PATTERN 1"));
     }
 
     #[test]
@@ -1131,7 +1228,7 @@ mod tests {
         let mut args = test_args();
         args.hook_flags = Some(0x2400);
         let config = Config::new(args).unwrap();
-        let src = mk_kernel_src(&config, true);
+        let src = mk_kernel_src(&config, KernelFlavor::OpenCl32);
 
         // lane 0 = 0xff ++ factory[0..7]; the test factory is all 0x11
         let lane0 = u64::from_le_bytes([0xff, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11]);
