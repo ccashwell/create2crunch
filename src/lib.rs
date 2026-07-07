@@ -15,6 +15,7 @@ use std::error::Error;
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::prelude::*;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use terminal_size::{terminal_size, Height};
 
@@ -80,6 +81,11 @@ pub struct Args {
     /// (exact match on all 14 flag bits, hex or decimal)
     #[arg(long, value_name = "FLAGS", value_parser = parse_hook_flags)]
     pub hook_flags: Option<u16>,
+
+    /// Also mine on all CPU cores while the GPU mines (no effect in CPU-only
+    /// mode)
+    #[arg(long)]
+    pub cpu: bool,
 }
 
 fn parse_fixed_bytes<const N: usize>(s: &str) -> Result<[u8; N], String> {
@@ -234,6 +240,7 @@ impl std::fmt::Display for Pattern {
 
 /// The resolved search configuration: the CREATE2 inputs plus either the
 /// classic zero-byte thresholds or a bit pattern to match.
+#[derive(Clone)]
 pub struct Config {
     pub factory_address: [u8; 20],
     pub calling_address: [u8; 20],
@@ -242,6 +249,7 @@ pub struct Config {
     pub leading_zeroes_threshold: u8,
     pub total_zeroes_threshold: u8,
     pub pattern: Option<Pattern>,
+    pub cpu: bool,
 }
 
 impl Config {
@@ -297,8 +305,43 @@ impl Config {
             leading_zeroes_threshold,
             total_zeroes_threshold,
             pattern,
+            cpu: args.cpu,
         })
     }
+}
+
+/// Solutions found so far, shared between concurrent miners for display.
+pub type FoundList = Arc<Mutex<Vec<String>>>;
+
+/// Dispatch mining according to the configuration: CPU-only, GPU-only, or
+/// GPU with CPU mining concurrently on a background thread (--cpu).
+pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
+    if config.gpu_device == 255 {
+        return cpu(config, None);
+    }
+
+    let found_list: Option<FoundList> = config.cpu.then(FoundList::default);
+    if let Some(list) = &found_list {
+        // leave one core free for the GPU host thread
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(1).max(1))
+            .unwrap_or(1);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build_global()
+            .ok();
+
+        let cpu_config = config.clone();
+        let cpu_list = list.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = cpu(cpu_config, Some(cpu_list)) {
+                eprintln!("CPU mining error: {e}");
+            }
+        });
+    }
+
+    gpu(config, found_list)?;
+    Ok(())
 }
 
 /// Given a Config object with a factory address, a caller address, and a
@@ -315,7 +358,7 @@ impl Config {
 /// address is found, it will be appended to `efficient_addresses.txt` along
 /// with the resultant address and the "value" (i.e. approximate rarity) of the
 /// resultant address.
-pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
+pub fn cpu(config: Config, found_list: Option<FoundList>) -> Result<(), Box<dyn Error>> {
     // (create if necessary) and open a file where found salts will be written
     let file = output_file();
 
@@ -405,7 +448,11 @@ pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
                     "{full_salt} => {address} => {}",
                     reward_amount.unwrap_or("0")
                 );
-                println!("{output}");
+                match &found_list {
+                    // concurrent with a GPU miner: report through its display
+                    Some(list) => list.lock().unwrap().push(output.clone()),
+                    None => println!("{output}"),
+                }
 
                 // create a lock on the file before writing
                 file.lock_exclusive().expect("Couldn't lock file.");
@@ -441,7 +488,7 @@ pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
 ///
 /// This method is still highly experimental and could almost certainly use
 /// further optimization - contributions are more than welcome!
-pub fn gpu(config: Config) -> ocl::Result<()> {
+pub fn gpu(config: Config, found_list: Option<FoundList>) -> ocl::Result<()> {
     println!(
         "Setting up experimental OpenCL miner using device {}...",
         config.gpu_device
@@ -453,9 +500,8 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
     // create object for computing rewards (relative rarity) for a given address
     let rewards = Reward::new();
 
-    // track how many addresses have been found and information about them
-    let mut found: u64 = 0;
-    let mut found_list: Vec<String> = vec![];
+    // track found addresses (shared with a concurrent CPU miner when --cpu)
+    let found_list = found_list.unwrap_or_default();
 
     // set up a controller for terminal output
     let term = Term::stdout();
@@ -601,10 +647,11 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
 
                 // display information about the attempt rate and found solutions
                 term.write_line(&format!(
-                    "rate: {:.2} million attempts per second\t\t\t\
+                    "rate: {:.2} million attempts per second{}\t\t\t\
                      total found this run: {}",
                     work_rate as f64 * rate,
-                    found
+                    if config.cpu { " (+ CPU mining)" } else { "" },
+                    found_list.lock().unwrap().len()
                 ))?;
 
                 // display information about the current search criteria
@@ -629,7 +676,10 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
 
                 // display recently found solutions based on terminal height
                 let rows = if height < 5 { 1 } else { height as usize - 4 };
-                let last_rows: Vec<String> = found_list.iter().cloned().rev().take(rows).collect();
+                let last_rows: Vec<String> = {
+                    let found_list = found_list.lock().unwrap();
+                    found_list.iter().cloned().rev().take(rows).collect()
+                };
                 let ordered: Vec<String> = last_rows.iter().cloned().rev().collect();
                 let recently_found = &ordered.join("\n");
                 term.write_line(recently_found)?;
@@ -726,14 +776,13 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
             );
 
             let show = format!("{output} ({leading} / {total})");
-            found_list.push(show.to_string());
+            found_list.lock().unwrap().push(show);
 
             file.lock_exclusive().expect("Couldn't lock file.");
 
             writeln!(&file, "{output}").expect("Couldn't write to `efficient_addresses.txt` file.");
 
             file.unlock().expect("Couldn't unlock file.");
-            found += 1;
         }
     }
 }
@@ -807,6 +856,7 @@ mod tests {
             prefix: None,
             suffix: None,
             hook_flags: None,
+            cpu: false,
         }
     }
 
