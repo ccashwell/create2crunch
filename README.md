@@ -33,7 +33,7 @@ A GPU run also mines on all CPU cores by default; pass `--no-cpu` to keep the ma
 
 Co-mining is not purely additive: the CPU competes with the GPU for memory bandwidth and thermal headroom, so the net gain on an M4 Max is about 15-20% over the GPU alone (the CPU's full standalone rate minus what the GPU gives up), in exchange for pinning every core.
 
-Measured on an Apple M4 Max (14-core CPU, 40-core GPU); GPU figures are cool-state and vary with thermals:
+Measured on an Apple M4 Max (14-core CPU, 40-core GPU) laptop. Two numbers are given for the GPU: the **burst** rate it hits while cool (the first few seconds of a run) and the **sustained** rate once the chassis heats up and the GPU thermally throttles. The live rate you see will start near the burst figure and settle toward sustained; a desktop Mac with better cooling holds closer to burst, a smaller chip sits below both.
 
 | Configuration | Rate |
 |---|---|
@@ -41,12 +41,12 @@ Measured on an Apple M4 Max (14-core CPU, 40-core GPU); GPU figures are cool-sta
 | CPU only, 2-way SHA3 NEON | ~151 Mh/s |
 | GPU, OpenCL backend, 64-bit kernel | ~63 Mh/s |
 | GPU, OpenCL backend, bit-interleaved kernel | ~71 Mh/s |
-| GPU, Metal backend, `--no-cpu` | ~740 Mh/s |
-| GPU Metal + CPU (default) | ~800 Mh/s |
+| GPU, Metal backend, `--no-cpu` | ~740 burst / ~460 sustained Mh/s |
+| GPU Metal + CPU (default) | ~890 burst / ~500 sustained Mh/s |
 
 Running both, the GPU retains ~85% of its solo rate (shared memory bandwidth) while the CPU adds its own, for a ~15-20% net gain over the GPU alone.
 
-At ~750 Mh/s, v4 hook flags alone (2^14) are instant, flags + a 4-character vanity prefix (2^30) averages under two seconds, flags + 6 characters (2^38) about six minutes, and flags + 8 characters (2^46) about a day.
+At the ~500 Mh/s sustained rate, v4 hook flags alone (2^14) are instant, flags + a 4-character vanity prefix (2^30) averages a couple of seconds, flags + 6 characters (2^38) about ten minutes, and flags + 8 characters (2^46) a day or two.
 
 ## Pattern mining (prefixes, suffixes, and Uniswap v4 hooks)
 
